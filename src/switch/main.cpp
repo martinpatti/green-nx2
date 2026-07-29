@@ -2623,6 +2623,17 @@ int main(int argc, char** argv) {
             }
         }
         if (!want_deko && app.deko_active) {
+            // Quiesce the engine BEFORE releasing the display. Manual exit
+            // already stops it first, but when the engine leaves Streaming on
+            // its own (server kick, stall watchdog, lost connection) we used
+            // to get here with the decode thread still feeding NVDEC while
+            // the swapchain and surface mappings were torn down under it --
+            // the display hand-off then races a live decoder, and a fatal in
+            // that window panics the OS error reporter itself (#33). stop()
+            // is idempotent and preserves the Failed state, so the error
+            // screen and A-to-retry behave as before.
+            if (app.engine->state() != stream::EngineState::Streaming)
+                app.engine->stop();
             app.engine->end_deko_output();  // release the swapchain first
             app.gfx.resume();
             app.deko_active = false;
