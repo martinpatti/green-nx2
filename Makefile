@@ -86,6 +86,8 @@ UAM        := $(DEVKITPRO)/tools/bin/uam
 SHADER_OUT := $(CURDIR)/romfs/shaders/video_vsh.dksh \
               $(CURDIR)/romfs/shaders/video_fsh.dksh \
               $(CURDIR)/romfs/shaders/hud_fsh.dksh
+# Seen by the inner (build-dir) make: repackage the .nro when a shader changes.
+export GNX_SHADERS := $(SHADER_OUT)
 
 .PHONY: all clean shaders
 
@@ -117,7 +119,9 @@ all: $(OUTPUT).nro
 
 # Relink when our objects OR the prebuilt WebRTC archives change; regenerate
 # the NACP (and thus repackage the .nro) when the Makefile/version changes.
-$(OUTPUT).nro: $(OUTPUT).elf $(OUTPUT).nacp
+# The compiled shaders live in romfs, which elf2nro bakes into the .nro --
+# without this dependency a shader-only change ships a stale binary.
+$(OUTPUT).nro: $(OUTPUT).elf $(OUTPUT).nacp $(GNX_SHADERS)
 $(OUTPUT).elf: $(OFILES) $(GNX_STREAM_DEPS)
 $(OFILES): $(MAKEFILE_LIST)
 
