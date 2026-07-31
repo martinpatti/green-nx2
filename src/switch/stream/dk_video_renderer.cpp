@@ -63,7 +63,7 @@ struct Transformation {
     alignas(16) float yuvmat_col2[4];
     alignas(16) float offset[4];
     alignas(16) float uv_data[4];
-    alignas(16) float sharp_data[4];  // x=strength, y=overshoot allowance
+    alignas(16) float sharp_data[4];  // x=strength, y=overshoot, zw=luma texel
 };
 static_assert(sizeof(Transformation) == 96, "std140 Transformation");
 
@@ -411,6 +411,11 @@ void DkVideoRenderer::update_transform(AVFrame* frame) {
     static constexpr float kSharpOvershoot[4] = {0.0f, 0.02f, 0.035f, 0.05f};
     t.sharp_data[0] = kSharpStrength[sharpness_];
     t.sharp_data[1] = kSharpOvershoot[sharpness_];
+    // One luma texel in UV units, for the shader's edge clamp and the
+    // sharpening taps. Computed here because uam's textureSize() returns
+    // junk on hardware (issue #40 -- the whole picture scrambled).
+    t.sharp_data[2] = luma_w_ ? 1.0f / (float)luma_w_ : 0.0f;
+    t.sharp_data[3] = luma_h_ ? 1.0f / (float)luma_h_ : 0.0f;
     std::memcpy(static_cast<uint8_t*>(data_cpu_) + kUniformOff, &t, sizeof(t));
     logf("deko3d: color space=%d full=%d crop=%.4fx%.4f sharp=%d", space,
          (int)full, t.uv_data[2], t.uv_data[3], sharpness_);

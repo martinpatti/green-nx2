@@ -14,7 +14,7 @@ layout (std140, binding = 0) uniform Transformation
     mat3 yuvmat;
     vec3 offset;
     vec4 uv_data;
-    vec4 sharp_data;
+    vec4 sharp_data;  // x=strength, y=overshoot, zw=one luma texel in UV
 } u;
 
 void main()
@@ -27,8 +27,12 @@ void main()
     // inside the visible region, or bilinear filtering on the last screen
     // line blends real chroma with padding garbage -- a green shimmer on
     // the bottom edge. The top/left need nothing: the image starts at 0.
-    vec2 lmax = u.uv_data.zw - 0.5 / vec2(textureSize(plane0, 0));
-    vec2 cmax = u.uv_data.zw - 0.5 / vec2(textureSize(plane1, 0));
+    // The texel size comes from the CPU side: uam's textureSize() returns
+    // junk on hardware and scrambled the whole picture (issue #40). The
+    // chroma texel is exactly twice the luma texel (NV12 half-res planes).
+    vec2 px = u.sharp_data.zw;
+    vec2 lmax = u.uv_data.zw - 0.5 * px;
+    vec2 cmax = u.uv_data.zw - px;
     vec2 luv = min(uv, lmax);
 
     // Luma-only unsharp mask (chroma untouched, so no color fringing). The
@@ -38,7 +42,6 @@ void main()
     // what keeps hard edges from growing halos.
     float y = texture(plane0, luv).r;
     if (u.sharp_data.x > 0.0) {
-        vec2 px = 1.0 / vec2(textureSize(plane0, 0));
         float yl = texture(plane0, min(luv - vec2(px.x, 0.0), lmax)).r;
         float yr = texture(plane0, min(luv + vec2(px.x, 0.0), lmax)).r;
         float yu = texture(plane0, min(luv - vec2(0.0, px.y), lmax)).r;
