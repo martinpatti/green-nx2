@@ -1981,13 +1981,25 @@ struct Input {
     int swipe_rows = 0;            // vertical swipe -> grid rows to scroll
 };
 
-Input poll_input(SDL_Joystick* joystick) {
+Input poll_input(SDL_Joystick*& joystick) {
     Input input;
     static float s_touch_down_x = 0, s_touch_down_y = 0;
     static bool s_touching = false;
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         if (event.type == SDL_QUIT) input.quit = true;
+        // Controller hotplug. Detaching the Joy-Cons mid-game (or pairing a
+        // Pro Controller) re-enumerates the controller: the handle opened at
+        // startup goes dead and every button read returns 0 forever -- the
+        // app looked frozen to input until an unrelated pairing shuffle
+        // happened to revive device 0. On any add/remove, drop the old
+        // handle and re-open player 1, which is whatever the console now
+        // considers the primary controller.
+        if (event.type == SDL_JOYDEVICEADDED ||
+            event.type == SDL_JOYDEVICEREMOVED) {
+            if (joystick) SDL_JoystickClose(joystick);
+            joystick = SDL_JoystickOpen(0);
+        }
         if (event.type == SDL_FINGERDOWN) {  // remember where the touch began
             s_touch_down_x = event.tfinger.x;
             s_touch_down_y = event.tfinger.y;
