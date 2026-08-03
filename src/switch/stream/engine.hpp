@@ -78,8 +78,14 @@ public:
     // renderer. Set from the "sharpness" setting before each stream start.
     void set_sharpness(int level) { sharpness_ = level; }
 
-    // Draw the on-screen debug HUD overlay while streaming. Set before start().
-    void set_debug_hud(bool enabled) { debug_hud_ = enabled; }
+    // Draw the on-screen debug HUD overlay while streaming. Forwarded live so
+    // the in-stream combo can flip it mid-session, not just before start().
+    void set_debug_hud(bool enabled) {
+        debug_hud_ = enabled;
+#ifdef __SWITCH__
+        dk_video_.set_hud_enabled(enabled);
+#endif
+    }
 
     EngineState state() const { return state_; }
     std::string status() const;

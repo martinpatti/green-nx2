@@ -394,6 +394,7 @@ struct App {
 #ifdef GNX_NATIVE_STREAM
     std::unique_ptr<stream::Engine> engine;
     Uint32 stream_hint_until = 0;
+    bool hud_combo_latch = false;  // ZL+ZR+- held: toggle HUD once per press
     bool deko_active = false;  // deko3d owns the display (SDL suspended)
     Uint32 last_input_ms = 0;  // input pacing during deko3d streaming
 #ifdef __SWITCH__
@@ -1576,7 +1577,7 @@ void draw_settings(App& app) {
         line2 = "library and favorites. Press A to switch or add one.";
     } else if (app.settings_cursor == accounts_row - 1) {
         line1 = "On-screen overlay with live stream stats (resolution, FPS,";
-        line2 = "bitrate, loss). A debug tool -- turn it off for clean playback.";
+        line2 = "bitrate, loss). Toggle in-game by holding ZL + ZR + −.";
     } else switch (app.settings_cursor) {
         case 5:
             line1 = "Output volume for streamed audio — raise it if the stream";
@@ -2574,6 +2575,19 @@ int main(int argc, char** argv) {
                         app.engine->stop();
                         app.scene = Scene::Library;
                     }
+                    // Debug HUD combo (#42): ZL + ZR + - toggles the overlay
+                    // without leaving the stream. Latched so one hold flips
+                    // it once; the setting persists like the Settings row.
+                    bool hud_combo =
+                        minus_held && !plus_held && joystick &&
+                        SDL_JoystickGetButton(joystick, kBtnZL) &&
+                        SDL_JoystickGetButton(joystick, kBtnZR);
+                    if (hud_combo && !app.hud_combo_latch) {
+                        app.settings.debug_hud = app.settings.debug_hud ? 0 : 1;
+                        save_settings(app.settings);
+                        app.engine->set_debug_hud(app.settings.debug_hud != 0);
+                    }
+                    app.hud_combo_latch = hud_combo;
                 } else if (stream_state == stream::EngineState::Stopped) {
                     // The server ended the session (stream stopped on the
                     // console, console switched off). Nothing to retry and
