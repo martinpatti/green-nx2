@@ -674,13 +674,21 @@ void Engine::worker() {
             bool retry_transport = false;
             SessionState logged_state = SessionState::New;
             std::string session_error;
-            for (int i = 0; i < 300 && !quit_; ++i) {
+            // A busy region can hold an allocation in WaitingForResources far
+            // longer than the old fixed 300-poll (~3.5 min) cap, which cut
+            // off sessions that would still have succeeded (#46). Time out
+            // per state instead: generous while the service says it is
+            // waiting for capacity, the old cap anywhere else. The user can
+            // still cancel out at any time (B sets quit_).
+            int polls_in_state = 0;
+            for (int poll = 0; !quit_; ++poll) {
                 SessionState state = session.refresh_state();
                 if (state != logged_state) {
                     logged_state = state;
+                    polls_in_state = 0;
                     log(std::string("session state: ") +
                         session_state_name(state) + " (poll " +
-                        std::to_string(i) + ")");
+                        std::to_string(poll) + ")");
                 }
                 if (state == SessionState::ReadyToConnect && !connected) {
                     set_status("Authenticating...");
@@ -699,6 +707,10 @@ void Engine::worker() {
                     session_error = session.error_details();
                     break;
                 }
+                int cap = state == SessionState::WaitingForResources
+                              ? 2570   // ~30 min in the allocation queue
+                              : 300;   // ~3.5 min for states that should move
+                if (++polls_in_state >= cap) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(700));
             }
             session.stop();
