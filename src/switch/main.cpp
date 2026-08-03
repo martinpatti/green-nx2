@@ -2057,6 +2057,17 @@ Input poll_input(SDL_Joystick*& joystick) {
             }
         }
     }
+    // A dead handle is not always followed by another hotplug event: a brief
+    // controller shuffle (seen during heavy lag spikes) can leave the reopen
+    // above with nothing to open, and input then stayed dead until the app
+    // was restarted (#45). Heal every poll instead: drop a handle SDL no
+    // longer considers attached, then keep retrying player 1 until a
+    // controller is back.
+    if (joystick && !SDL_JoystickGetAttached(joystick)) {
+        SDL_JoystickClose(joystick);
+        joystick = nullptr;
+    }
+    if (!joystick && SDL_NumJoysticks() > 0) joystick = SDL_JoystickOpen(0);
     // Left analog stick also drives menu navigation: emit one directional
     // step each time the stick crosses into a deflected zone (matches the
     // one-per-press behaviour of the d-pad).
