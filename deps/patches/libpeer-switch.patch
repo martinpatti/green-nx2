@@ -401,8 +401,66 @@ index 94905a8..1d204ff 100644
  #endif
  
  #define CONFIG_IPV6 0
+diff --git a/src/dtls_srtp.c b/src/dtls_srtp.c
+index dd54616..463f738 100644
+--- a/src/dtls_srtp.c
++++ b/src/dtls_srtp.c
+@@ -213,8 +213,18 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
+ 
+   mbedtls_ssl_conf_cert_req_ca_list(&dtls_srtp->conf, MBEDTLS_SSL_CERT_REQ_CA_LIST_DISABLED);
+ 
++  // Retransmit lost handshake flights at 1/2/4 s, then give up: keeps a full
++  // attempt (~7 s of resends) inside the engine's 12 s dead-media window.
++  // Must come after ssl_config_defaults or the preset would overwrite it.
++  mbedtls_ssl_conf_handshake_timeout(&dtls_srtp->conf, 1000, 4000);
++
+   mbedtls_ssl_setup(&dtls_srtp->ssl, &dtls_srtp->conf);
+ 
++  // Keep our DTLS records comfortably under common path MTUs (PPPoE, CGNAT
++  // tunnels): 1200 matches what browsers assume for WebRTC. Only affects
++  // fragments we send; the server sizes its own.
++  mbedtls_ssl_set_mtu(&dtls_srtp->ssl, 1200);
++
+   return 0;
+ }
+ 
+@@ -381,9 +391,21 @@ static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
+ 
+   mbedtls_ssl_set_bio(&dtls_srtp->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
+ 
++  // Event-driven handshake: the recv callback returns WANT_READ instead of
++  // blocking, so this loop is what gives the retransmission timer (set above)
++  // a chance to fire and resend lost flights. mbedtls itself gives up with
++  // MBEDTLS_ERR_SSL_TIMEOUT once the configured handshake timeout is spent;
++  // the spin cap is only a backstop should the timer ever misbehave.
++  int spins = 0;
+   do {
+     ret = mbedtls_ssl_handshake(&dtls_srtp->ssl);
+-
++    if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
++      if (++spins > 15000) {
++        ret = MBEDTLS_ERR_SSL_TIMEOUT;
++        break;
++      }
++      usleep(1000);
++    }
+   } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+ 
+   return ret;
+@@ -422,6 +444,11 @@ static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
+ static int dtls_srtp_handshake_client(DtlsSrtp* dtls_srtp) {
+   int ret;
+ 
++  // A failed attempt leaves the ssl context mid-handshake and the docs
++  // require a reset before reuse (config, bio and timers are retained).
++  // Safe on a fresh context too, so do it unconditionally.
++  mbedtls_ssl_session_reset(&dtls_srtp->ssl);
++
+   ret = dtls_srtp_do_handshake(dtls_srtp);
+   if (ret != 0) {
+     LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x\n\n", (unsigned int)-ret);
 diff --git a/src/peer_connection.c b/src/peer_connection.c
-index c763e80..b3442c2 100644
+index c763e80..3e28201 100644
 --- a/src/peer_connection.c
 +++ b/src/peer_connection.c
 @@ -45,6 +45,10 @@ struct PeerConnection {
@@ -416,7 +474,26 @@ index c763e80..b3442c2 100644
  };
  
  static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
-@@ -92,6 +96,22 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
+@@ -64,6 +68,18 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t
+     return pc->agent_ret;
+   }
+ 
++  // During the handshake, never block and never return 0: mbedtls reads 0 as
++  // "connection closed" (MBEDTLS_ERR_SSL_CONN_EOF, the -0x7280 in the field
++  // logs) and gives up, and blocking here for CONFIG_TLS_READ_TIMEOUT stops
++  // its retransmission timer from ever firing, so each attempt sent exactly
++  // one ClientHello and died to a single lost packet. Returning WANT_READ
++  // hands control back to dtls_srtp_do_handshake, whose timer resends lost
++  // flights. The post-handshake path below is intentionally untouched.
++  if (dtls_srtp->state != DTLS_SRTP_STATE_CONNECTED) {
++    ret = agent_recv(&pc->agent, buf, len);
++    return ret > 0 ? ret : MBEDTLS_ERR_SSL_WANT_READ;
++  }
++
+   while (recv_max < CONFIG_TLS_READ_TIMEOUT && pc->state == PEER_CONNECTION_CONNECTED) {
+     ret = agent_recv(&pc->agent, buf, len);
+ 
+@@ -92,6 +108,22 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
      rtcp_header = (RtcpHeader*)(buf + pos);
  
      switch (rtcp_header->type) {
@@ -439,7 +516,7 @@ index c763e80..b3442c2 100644
        case RTCP_RR:
          LOGD("RTCP_PR");
          if (rtcp_header->rc > 0) {
-@@ -213,6 +233,161 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
+@@ -213,6 +245,161 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
    return rtp_encoder_encode(&pc->vrtp_encoder, buf, len);
  }
  
@@ -601,7 +678,7 @@ index c763e80..b3442c2 100644
  int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t len) {
    return peer_connection_datachannel_send_sid(pc, message, len, 0);
  }
-@@ -228,6 +403,17 @@ int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size
+@@ -228,6 +415,17 @@ int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size
      return sctp_outgoing_data(&pc->sctp, message, len, PPID_BINARY, sid);
  }
  
@@ -619,7 +696,7 @@ index c763e80..b3442c2 100644
  int peer_connection_create_datachannel(PeerConnection* pc, DecpChannelType channel_type, uint16_t priority, uint32_t reliability_parameter, char* label, char* protocol) {
    return peer_connection_create_datachannel_sid(pc, channel_type, priority, reliability_parameter, label, protocol, 0);
  }
-@@ -268,6 +454,7 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
+@@ -268,6 +466,7 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
    }
  
    msg[0] = DATA_CHANNEL_OPEN;
@@ -627,7 +704,7 @@ index c763e80..b3442c2 100644
    memcpy(msg + 2, &priority_big_endian, sizeof(uint16_t));
    memcpy(msg + 4, &reliability_big_endian, sizeof(uint32_t));
    memcpy(msg + 8, &label_length, sizeof(uint16_t));
-@@ -277,6 +464,11 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
+@@ -277,6 +476,11 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
  
    rtrn = sctp_outgoing_data(&pc->sctp, msg, msg_size, PPID_CONTROL, sid);
    free(msg);
@@ -639,7 +716,7 @@ index c763e80..b3442c2 100644
    return rtrn;
  }
  
-@@ -342,6 +534,26 @@ int peer_connection_loop(PeerConnection* pc) {
+@@ -342,6 +546,26 @@ int peer_connection_loop(PeerConnection* pc) {
              rtp_decoder_decode(&pc->artp_decoder, pc->agent_buf, pc->agent_ret);
            } else if (ssrc == pc->remote_vssrc) {
              rtp_decoder_decode(&pc->vrtp_decoder, pc->agent_buf, pc->agent_ret);
@@ -666,7 +743,7 @@ index c763e80..b3442c2 100644
            }
  
          } else {
-@@ -365,7 +577,9 @@ int peer_connection_loop(PeerConnection* pc) {
+@@ -365,7 +589,9 @@ int peer_connection_loop(PeerConnection* pc) {
        break;
    }
  
@@ -677,7 +754,7 @@ index c763e80..b3442c2 100644
  }
  
  void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType type) {
-@@ -432,7 +646,11 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
+@@ -432,7 +658,11 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
  
    switch (sdp_type) {
      case SDP_TYPE_OFFER:
@@ -690,7 +767,7 @@ index c763e80..b3442c2 100644
        agent_clear_candidates(&pc->agent);
        pc->agent.mode = AGENT_MODE_CONTROLLING;
        break;
-@@ -578,6 +796,10 @@ char* peer_connection_lookup_sid_label(PeerConnection* pc, uint16_t sid) {
+@@ -578,6 +808,10 @@ char* peer_connection_lookup_sid_label(PeerConnection* pc, uint16_t sid) {
  
  int peer_connection_add_ice_candidate(PeerConnection* pc, char* candidate) {
    Agent* agent = &pc->agent;
