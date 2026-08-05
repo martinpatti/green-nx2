@@ -225,7 +225,9 @@ private:
     std::atomic<uint32_t> source_refresh_period_{1};  // 1=60fps, 2=30fps
     uint32_t source_fast_streak_ = 0;  // decode thread only
     uint32_t source_slow_streak_ = 0;  // decode thread only
-    Uint64 last_decode_ticks_ = 0;     // decode thread only
+    // Written by the decode thread on every decoded frame; also read by the
+    // worker's video-stall watchdog (and reset by it after a suspension).
+    std::atomic<Uint64> last_decode_ticks_{0};
 
     // Pacing telemetry, logged once per second from run_peer (pace| line):
     // new/repeated presents, how many refreshes each frame stayed up, and

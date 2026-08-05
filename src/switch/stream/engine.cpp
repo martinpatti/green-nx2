@@ -1076,8 +1076,10 @@ bool Engine::run_peer(GssvSession& session) {
         // The app can be suspended mid-stream (HOME menu, console sleep):
         // every thread freezes while the wall clock keeps running, so the
         // gap is not a stall. Restart the window from the moment we resume.
-        if (now - last_loop_tick > 2000)
+        if (now - last_loop_tick > 2000) {
             last_media_ticks_.store(now, std::memory_order_relaxed);
+            last_decode_ticks_.store(now, std::memory_order_relaxed);
+        }
         last_loop_tick = now;
         // Media-stall watchdog. RTP stops the moment a session really ends,
         // but libpeer needs ~20 s of failed consent checks to notice, and a
@@ -1088,6 +1090,18 @@ bool Engine::run_peer(GssvSession& session) {
             Uint64 last_media = last_media_ticks_.load(std::memory_order_relaxed);
             if (last_media && now - last_media > 10000) {
                 fail("Stream stalled: no video or audio for 10s");
+                return true;
+            }
+            // Video-only stall (#45): after heavy loss the jitter buffer can
+            // wait forever for a clean IDR while audio and even video RTP keep
+            // flowing, so the media watchdog above never fires and the last
+            // frame stays on screen until the app is killed. Fifteen seconds
+            // without a single DECODED frame (with PLIs going out ~1/s the
+            // whole time) means the picture is not coming back on its own.
+            Uint64 last_decode =
+                last_decode_ticks_.load(std::memory_order_relaxed);
+            if (last_decode && now - last_decode > 15000) {
+                fail("Video stalled for 15s, please start the stream again");
                 return true;
             }
         }
