@@ -402,7 +402,7 @@ index 94905a8..1d204ff 100644
  
  #define CONFIG_IPV6 0
 diff --git a/src/dtls_srtp.c b/src/dtls_srtp.c
-index dd54616..463f738 100644
+index dd54616..0d9ef47 100644
 --- a/src/dtls_srtp.c
 +++ b/src/dtls_srtp.c
 @@ -213,8 +213,18 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
@@ -459,8 +459,47 @@ index dd54616..463f738 100644
    ret = dtls_srtp_do_handshake(dtls_srtp);
    if (ret != 0) {
      LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x\n\n", (unsigned int)-ret);
+@@ -476,25 +503,30 @@ void dtls_srtp_reset_session(DtlsSrtp* dtls_srtp) {
+ 
+ int dtls_srtp_write(DtlsSrtp* dtls_srtp, const unsigned char* buf, size_t len) {
+   int ret;
++  int spins = 0;
+ 
+   do {
+     ret = mbedtls_ssl_write(&dtls_srtp->ssl, buf, len);
+ 
++    // Bounded: this runs on the input-send path with the peer lock held. An
++    // ssl context that keeps asking for I/O must drop the packet (datachannel
++    // frames are periodic full-state), not spin the app into a freeze.
++    if (++spins > 1000) {
++      break;
++    }
+   } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+   return ret;
+ }
+ 
+ int dtls_srtp_read(DtlsSrtp* dtls_srtp, unsigned char* buf, size_t len) {
+-  int ret;
+-
+   memset(buf, 0, len);
+ 
+-  do {
+-    ret = mbedtls_ssl_read(&dtls_srtp->ssl, buf, len);
+-
+-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+-
+-  return ret;
++  // No retry loop. The bio serves exactly the one datagram the caller stashed
++  // (see peer_connection_dtls_srtp_recv): WANT_READ back means that datagram
++  // held no application data (a record mbedtls discarded), and the caller
++  // simply moves on to the next datagram. Retrying here re-read the same
++  // bytes forever and froze the worker with the peer lock held.
++  return mbedtls_ssl_read(&dtls_srtp->ssl, buf, len);
+ }
+ 
+ int dtls_srtp_probe(uint8_t* buf) {
 diff --git a/src/peer_connection.c b/src/peer_connection.c
-index c763e80..3e28201 100644
+index c763e80..e317dca 100644
 --- a/src/peer_connection.c
 +++ b/src/peer_connection.c
 @@ -45,6 +45,10 @@ struct PeerConnection {
@@ -474,25 +513,56 @@ index c763e80..3e28201 100644
  };
  
  static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
-@@ -64,6 +68,18 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t
-     return pc->agent_ret;
+@@ -54,26 +58,38 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
+ }
+ 
+ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t len) {
+-  int recv_max = 0;
+   int ret = -1;
+   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
+   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
+ 
++  // Hand mbedtls the datagram peer_connection_loop already pulled off the
++  // socket -- exactly once. agent_ret must be consumed here: leaving it set
++  // re-served the same datagram on every subsequent bio call, so a record
++  // mbedtls silently discards (anti-replay duplicate after a lag spike, bad
++  // MAC) made it fetch the same bytes forever and the worker never returned
++  // from dtls_srtp_read, wedging the whole app.
+   if (pc->agent_ret > 0 && pc->agent_ret <= len) {
+-    memcpy(buf, pc->agent_buf, pc->agent_ret);
+-    return pc->agent_ret;
++    ret = pc->agent_ret;
++    pc->agent_ret = -1;
++    memcpy(buf, pc->agent_buf, ret);
++    return ret;
    }
  
+-  while (recv_max < CONFIG_TLS_READ_TIMEOUT && pc->state == PEER_CONNECTION_CONNECTED) {
 +  // During the handshake, never block and never return 0: mbedtls reads 0 as
 +  // "connection closed" (MBEDTLS_ERR_SSL_CONN_EOF, the -0x7280 in the field
 +  // logs) and gives up, and blocking here for CONFIG_TLS_READ_TIMEOUT stops
 +  // its retransmission timer from ever firing, so each attempt sent exactly
 +  // one ClientHello and died to a single lost packet. Returning WANT_READ
 +  // hands control back to dtls_srtp_do_handshake, whose timer resends lost
-+  // flights. The post-handshake path below is intentionally untouched.
++  // flights.
 +  if (dtls_srtp->state != DTLS_SRTP_STATE_CONNECTED) {
-+    ret = agent_recv(&pc->agent, buf, len);
-+    return ret > 0 ? ret : MBEDTLS_ERR_SSL_WANT_READ;
-+  }
-+
-   while (recv_max < CONFIG_TLS_READ_TIMEOUT && pc->state == PEER_CONNECTION_CONNECTED) {
      ret = agent_recv(&pc->agent, buf, len);
+-
+-    if (ret > 0) {
+-      break;
+-    }
+-
+-    recv_max++;
++    return ret > 0 ? ret : MBEDTLS_ERR_SSL_WANT_READ;
+   }
+-  return ret;
++
++  // Data phase: the socket belongs to peer_connection_loop, never read it
++  // from inside the bio. No stashed datagram left means this read is done.
++  return MBEDTLS_ERR_SSL_WANT_READ;
+ }
  
+ static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t len) {
 @@ -92,6 +108,22 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
      rtcp_header = (RtcpHeader*)(buf + pos);
  

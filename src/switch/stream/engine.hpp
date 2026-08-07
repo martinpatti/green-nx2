@@ -175,7 +175,10 @@ private:
     std::mutex log_mutex_;
 
     PeerConnection* peer_ = nullptr;
-    std::mutex peer_mutex_;
+    // timed_mutex: the render/input thread takes it with a bounded wait
+    // (send_gamepad) so a wedged worker can never freeze presentation and
+    // input polling behind it (#45).
+    std::timed_mutex peer_mutex_;
     std::atomic<PeerConnectionState> peer_state_{PEER_CONNECTION_NEW};
     std::atomic<bool> channels_open_{false};
     std::atomic<bool> handshake_done_{false};
@@ -186,6 +189,10 @@ private:
     // Last RTP arrival, video or audio (peer thread). run_peer's stall
     // watchdog uses it to end a stream whose media path died silently.
     std::atomic<Uint64> last_media_ticks_{0};
+    // Heartbeat of run_peer's pump loop, stored every iteration. The
+    // keepalive thread watches it: the in-loop watchdogs can't see the loop
+    // itself wedging inside libpeer (#45), an outside thread can.
+    std::atomic<Uint64> worker_tick_{0};
 
     VideoDecoder video_;  // width()/height() are render-thread reads only
 #ifdef __SWITCH__

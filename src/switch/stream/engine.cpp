@@ -177,6 +177,7 @@ void Engine::start_common(const std::string& title_id, QualityTier tier,
     handshake_done_ = false;
     server_ended_ = false;
     last_media_ticks_ = 0;
+    worker_tick_ = 0;
     peer_state_ = PEER_CONNECTION_NEW;  // previous session left it CLOSED
     pli_sent_ = 0;
     // Cumulative, and the HUD's bitrate window starts from zero in run_peer:
@@ -229,7 +230,7 @@ void Engine::stop() {
         log_file_ = nullptr;
     }
     {
-        std::lock_guard<std::mutex> lock(peer_mutex_);
+        std::lock_guard<std::timed_mutex> lock(peer_mutex_);
         if (peer_) {
             peer_connection_close(peer_);
             peer_connection_destroy(peer_);
@@ -376,7 +377,7 @@ void Engine::on_state_change(PeerConnectionState state, void* user) {
 // ---- data channel plumbing ------------------------------------------------
 
 void Engine::open_data_channels() {
-    std::lock_guard<std::mutex> lock(peer_mutex_);
+    std::lock_guard<std::timed_mutex> lock(peer_mutex_);
     if (!peer_) return;
     // The DTLS client uses even SCTP stream ids (RFC 8832). xCloud maps each
     // channel by its DCEP label, so the exact ids only need to be distinct.
@@ -404,7 +405,7 @@ void Engine::open_data_channels() {
 }
 
 void Engine::send_on_channel(const char* label, const std::string& payload) {
-    std::lock_guard<std::mutex> lock(peer_mutex_);
+    std::lock_guard<std::timed_mutex> lock(peer_mutex_);
     send_on_channel_locked(label, payload);
 }
 
@@ -428,7 +429,13 @@ void Engine::send_on_channel_locked(const char* label,
 
 void Engine::send_binary_on_channel(const char* label,
                                     const std::vector<uint8_t>& payload) {
-    std::lock_guard<std::mutex> lock(peer_mutex_);
+    // Render/input thread (send_gamepad). Bounded wait, never a full block:
+    // if the worker wedges inside libpeer while holding peer_mutex_, an
+    // unbounded lock here froze presentation, input polling and the exit
+    // combo with it (#45). Dropping one 125 Hz full-state input frame is
+    // invisible; freezing the app is not.
+    std::unique_lock<std::timed_mutex> lock(peer_mutex_, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::milliseconds(4))) return;
     send_binary_on_channel_locked(label, payload);
 }
 
@@ -724,7 +731,7 @@ void Engine::worker() {
                 {
                     // Dispose of the dead attempt's peer (normally stop()'s
                     // job) so the next run_peer starts from scratch.
-                    std::lock_guard<std::mutex> lock(peer_mutex_);
+                    std::lock_guard<std::timed_mutex> lock(peer_mutex_);
                     if (peer_) {
                         peer_connection_close(peer_);
                         peer_connection_destroy(peer_);
@@ -784,7 +791,7 @@ bool Engine::run_peer(GssvSession& session) {
     config.user_data = this;
 
     {
-        std::lock_guard<std::mutex> lock(peer_mutex_);
+        std::lock_guard<std::timed_mutex> lock(peer_mutex_);
         peer_ = peer_connection_create(&config);
         if (!peer_) {
             fail("Failed to create peer connection");
@@ -802,7 +809,7 @@ bool Engine::run_peer(GssvSession& session) {
 
     const char* offer = nullptr;
     {
-        std::lock_guard<std::mutex> lock(peer_mutex_);
+        std::lock_guard<std::timed_mutex> lock(peer_mutex_);
         offer = peer_connection_create_offer(peer_);
     }
     if (!offer) {
@@ -915,7 +922,7 @@ bool Engine::run_peer(GssvSession& session) {
     }
 
     {
-        std::lock_guard<std::mutex> lock(peer_mutex_);
+        std::lock_guard<std::timed_mutex> lock(peer_mutex_);
         for (const std::string& candidate : remote)
             peer_connection_add_ice_candidate(
                 peer_, const_cast<char*>(candidate.c_str()));
@@ -937,6 +944,8 @@ bool Engine::run_peer(GssvSession& session) {
     std::thread keepalive_thread([this, &session, &keepalive_stop] {
         Uint64 next = SDL_GetTicks64() + 15000;
         Uint64 next_flush = SDL_GetTicks64() + 2000;
+        Uint64 prev_round = SDL_GetTicks64();
+        bool stall_reported = false;
         while (!quit_ && !keepalive_stop) {
             Uint64 now = SDL_GetTicks64();
             // The buffered log (setvbuf in start_common) reaches the card only
@@ -948,6 +957,20 @@ bool Engine::run_peer(GssvSession& session) {
                 std::lock_guard<std::mutex> lock(log_mutex_);
                 if (log_file_) std::fflush(log_file_);
             }
+            // Worker-stall watchdog. The pump loop's own watchdogs cannot see
+            // the pump wedging inside libpeer (#45): the log just stopped and
+            // the app froze with no trace. This thread never touches
+            // peer_mutex_, so it survives to record it and end the session.
+            // A >2 s gap in our own rounds means the app was suspended (every
+            // thread froze together): skip that round instead of misreading
+            // the worker's stale heartbeat.
+            Uint64 tick = worker_tick_.load(std::memory_order_relaxed);
+            if (now - prev_round <= 2000 && !stall_reported && tick &&
+                now - tick > 10000) {
+                stall_reported = true;
+                fail("Stream engine stalled, please start the stream again");
+            }
+            prev_round = now;
             if (now < next) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(
                     std::min<Uint64>(100, next - now)));
@@ -1001,7 +1024,7 @@ bool Engine::run_peer(GssvSession& session) {
         // send input between batches, and only sleep when the socket is idle.
         bool drained_any = false;
         {
-            std::lock_guard<std::mutex> lock(peer_mutex_);
+            std::lock_guard<std::timed_mutex> lock(peer_mutex_);
             for (int i = 0; peer_ && i < 64; ++i) {
                 if (peer_connection_loop(peer_) > 0)
                     drained_any = true;
@@ -1081,6 +1104,7 @@ bool Engine::run_peer(GssvSession& session) {
             last_decode_ticks_.store(now, std::memory_order_relaxed);
         }
         last_loop_tick = now;
+        worker_tick_.store(now, std::memory_order_relaxed);
         // Media-stall watchdog. RTP stops the moment a session really ends,
         // but libpeer needs ~20 s of failed consent checks to notice, and a
         // half-open path may never close at all. Ten seconds without a single
@@ -1110,7 +1134,7 @@ bool Engine::run_peer(GssvSession& session) {
         // start mid-GOP (only P-frames) or drop our first request; a single
         // request isn't enough. request_keyframe_locked() self-throttles to 1/s.
         if (handshake_done_ && !got_frame_) {
-            std::lock_guard<std::mutex> lock(peer_mutex_);
+            std::lock_guard<std::timed_mutex> lock(peer_mutex_);
             request_keyframe_locked();
         }
 
@@ -1137,7 +1161,7 @@ bool Engine::run_peer(GssvSession& session) {
             uint32_t cumulative, highest_ext;
             if (jitter_.report_stats(&fraction, &cumulative, &highest_ext)) {
                 {
-                    std::lock_guard<std::mutex> lock(peer_mutex_);
+                    std::lock_guard<std::timed_mutex> lock(peer_mutex_);
                     if (peer_) {
                         peer_connection_send_receiver_report(
                             peer_, fraction, cumulative, highest_ext, 0);
@@ -1218,7 +1242,7 @@ bool Engine::run_peer(GssvSession& session) {
         // media alive. A full WebRTC stack does this every ~5s; libpeer doesn't.
         if (now - last_consent > 2000) {
             last_consent = now;
-            std::lock_guard<std::mutex> lock(peer_mutex_);
+            std::lock_guard<std::timed_mutex> lock(peer_mutex_);
             if (peer_) peer_connection_send_consent(peer_);
         }
 
@@ -1456,7 +1480,12 @@ void Engine::send_gamepad(const xcloud::GamepadFrame& frame) {
 }
 
 void Engine::request_keyframe() {
-    std::lock_guard<std::mutex> lock(peer_mutex_);
+    // Called off the worker (decode thread / render thread). Opportunistic:
+    // it self-throttles to 1/s and the worker sends PLIs on its own, so
+    // skipping when the lock is busy loses nothing -- and never blocks a
+    // latency-critical thread on the network lock.
+    std::unique_lock<std::timed_mutex> lock(peer_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) return;
     request_keyframe_locked();
 }
 
