@@ -940,6 +940,10 @@ bool Engine::run_peer(GssvSession& session) {
     // completes nothing else touches `session` until run_peer returns, and
     // the RAII joiner covers every return path (a destroyed joinable thread
     // would std::terminate).
+    // A previous attempt's heartbeat is stale by definition; without this
+    // the stall watchdog below fired while a retry session was still
+    // negotiating, before its pump loop ever ran.
+    worker_tick_ = 0;
     std::atomic<bool> keepalive_stop{false};
     std::thread keepalive_thread([this, &session, &keepalive_stop] {
         Uint64 next = SDL_GetTicks64() + 15000;
