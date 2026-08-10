@@ -288,7 +288,7 @@ struct Settings {
     bool smooth = false;
     int sharpness = 0;  // luma sharpening: 0=Off, 1=Low, 2=Medium, 3=High
     int debug_hud = 0;  // 0=off, 1=on: on-screen debug overlay while streaming
-    int deadzone = 1;   // stick deadzone: index into kDeadzoneLabels/Values
+    int deadzone = 0;   // stick deadzone: index into kDeadzoneLabels/Values
 };
 
 constexpr int kLanguageCount = 14;
@@ -430,7 +430,7 @@ Settings load_settings() {
     settings.sharpness = std::clamp(data.value("sharpness", 0), 0, 3);
     settings.debug_hud = std::clamp(data.value("debug_hud", 0), 0, 1);
     settings.deadzone =
-        std::clamp(data.value("deadzone", 1), 0, kDeadzoneLevels - 1);
+        std::clamp(data.value("deadzone", 0), 0, kDeadzoneLevels - 1);
     return settings;
 }
 
