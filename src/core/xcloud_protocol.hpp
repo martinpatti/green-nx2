@@ -44,6 +44,12 @@ public:
     std::vector<uint8_t> gamepad_packet(const GamepadFrame& frame,
                                         double elapsed_ms);
 
+    // The server must see contiguous sequence numbers (the reference client
+    // assigns them at actual send time, so it can never skip one). A packet
+    // that was built but never handed to SCTP must give its number back.
+    void rollback_sequence() { --sequence_; }
+    uint32_t sequence() const { return sequence_; }
+
 private:
     uint32_t sequence_ = 0;
 };

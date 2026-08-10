@@ -136,11 +136,12 @@ private:
     void open_data_channels();
     void request_keyframe_locked();  // caller holds peer_mutex_
     void send_on_channel(const char* label, const std::string& payload);
-    void send_binary_on_channel(const char* label,
-                                const std::vector<uint8_t>& payload);
     // *_locked: caller already holds peer_mutex_ (callbacks run under it).
     void send_on_channel_locked(const char* label, const std::string& payload);
-    void send_binary_on_channel_locked(const char* label,
+    // Returns false when the channel is missing or SCTP rejected the payload
+    // (send buffer full during an outage) -- send_gamepad rolls the input
+    // sequence number back on failure to keep the numbering contiguous.
+    bool send_binary_on_channel_locked(const char* label,
                                        const std::vector<uint8_t>& payload);
 
     static void on_video(uint8_t* data, size_t size, void* user);
@@ -193,6 +194,12 @@ private:
     // keepalive thread watches it: the in-loop watchdogs can't see the loop
     // itself wedging inside libpeer (#45), an outside thread can.
     std::atomic<Uint64> worker_tick_{0};
+    // Input-path telemetry, logged once per second (input| line): frames
+    // sent, dropped waiting for peer_mutex_, rejected by SCTP. The
+    // dead-controller reports in #45 were undebuggable without this.
+    std::atomic<uint32_t> input_sent_{0};
+    std::atomic<uint32_t> input_drop_lock_{0};
+    std::atomic<uint32_t> input_send_fail_{0};
 
     VideoDecoder video_;  // width()/height() are render-thread reads only
 #ifdef __SWITCH__

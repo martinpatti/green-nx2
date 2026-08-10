@@ -178,6 +178,9 @@ void Engine::start_common(const std::string& title_id, QualityTier tier,
     server_ended_ = false;
     last_media_ticks_ = 0;
     worker_tick_ = 0;
+    input_sent_ = 0;
+    input_drop_lock_ = 0;
+    input_send_fail_ = 0;
     peer_state_ = PEER_CONNECTION_NEW;  // previous session left it CLOSED
     pli_sent_ = 0;
     // Cumulative, and the HUD's bitrate window starts from zero in run_peer:
@@ -427,27 +430,15 @@ void Engine::send_on_channel_locked(const char* label,
     }
 }
 
-void Engine::send_binary_on_channel(const char* label,
-                                    const std::vector<uint8_t>& payload) {
-    // Render/input thread (send_gamepad). Bounded wait, never a full block:
-    // if the worker wedges inside libpeer while holding peer_mutex_, an
-    // unbounded lock here froze presentation, input polling and the exit
-    // combo with it (#45). Dropping one 125 Hz full-state input frame is
-    // invisible; freezing the app is not.
-    std::unique_lock<std::timed_mutex> lock(peer_mutex_, std::defer_lock);
-    if (!lock.try_lock_for(std::chrono::milliseconds(4))) return;
-    send_binary_on_channel_locked(label, payload);
-}
-
-void Engine::send_binary_on_channel_locked(const char* label,
+bool Engine::send_binary_on_channel_locked(const char* label,
                                            const std::vector<uint8_t>& payload) {
-    if (!peer_) return;
+    if (!peer_) return false;
     uint16_t sid = 0;
-    if (peer_connection_lookup_sid(peer_, label, &sid) == 0)
-        peer_connection_datachannel_send_sid(
-            peer_,
-            const_cast<char*>(reinterpret_cast<const char*>(payload.data())),
-            payload.size(), sid);
+    if (peer_connection_lookup_sid(peer_, label, &sid) != 0) return false;
+    return peer_connection_datachannel_send_sid(
+               peer_,
+               const_cast<char*>(reinterpret_cast<const char*>(payload.data())),
+               payload.size(), sid) >= 0;
 }
 
 void Engine::handle_channel_message(uint16_t sid, const char* data,
@@ -1249,6 +1240,19 @@ bool Engine::run_peer(GssvSession& session) {
                     " src=" + (source_refresh_period_.load() == 2 ? "30" : "60") +
                     "fps q=" + std::to_string(smooth_q));
 #endif
+                // Input-channel health (#45): frames sent vs dropped waiting
+                // for peer_mutex_ vs rejected by SCTP, plus the sequence the
+                // server should be at. drop/fail spikes around a lag spike are
+                // exactly what the dead-controller reports could not show.
+                uint32_t input_seq;
+                {
+                    std::lock_guard<std::mutex> input_lock(input_mutex_);
+                    input_seq = input_.sequence();
+                }
+                log("input| sent=" + std::to_string(input_sent_.exchange(0)) +
+                    " drop=" + std::to_string(input_drop_lock_.exchange(0)) +
+                    " fail=" + std::to_string(input_send_fail_.exchange(0)) +
+                    " seq=" + std::to_string(input_seq));
             }
         }
 
@@ -1484,13 +1488,35 @@ void Engine::send_gamepad(const xcloud::GamepadFrame& frame) {
     if (peer_state != PEER_CONNECTION_CONNECTED &&
         peer_state != PEER_CONNECTION_COMPLETED)
         return;
+    // Bounded wait, never a full block: if the worker wedges inside libpeer
+    // while holding peer_mutex_, an unbounded lock here froze presentation,
+    // input polling and the exit combo with it (#45). Dropping one 125 Hz
+    // full-state frame is invisible; freezing the app is not.
+    std::unique_lock<std::timed_mutex> lock(peer_mutex_, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::milliseconds(4))) {
+        input_drop_lock_++;
+        return;
+    }
+    // Serialize only once the send is certain to be attempted: every built
+    // packet consumes a sequence number, and the server only ever sees
+    // contiguous numbers from the reference client (it assigns them at send
+    // time). Building before the lock burned hundreds of numbers during a
+    // lag spike while the worker sat in a blocking send; the input channel
+    // then stayed dead for the rest of the session (#45).
     std::vector<uint8_t> packet;
     {
-        std::lock_guard<std::mutex> lock(input_mutex_);
+        std::lock_guard<std::mutex> input_lock(input_mutex_);
         packet = input_.gamepad_packet(
             frame, static_cast<double>(SDL_GetTicks64() - stream_epoch_));
     }
-    send_binary_on_channel("input", packet);
+    if (send_binary_on_channel_locked("input", packet)) {
+        input_sent_++;
+    } else {
+        input_send_fail_++;
+        // Give the unused number back so the next frame stays contiguous.
+        std::lock_guard<std::mutex> input_lock(input_mutex_);
+        input_.rollback_sequence();
+    }
 }
 
 void Engine::request_keyframe() {
