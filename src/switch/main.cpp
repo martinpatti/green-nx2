@@ -289,11 +289,13 @@ struct Settings {
     int sharpness = 0;  // luma sharpening: 0=Off, 1=Low, 2=Medium, 3=High
     int debug_hud = 0;  // 0=off, 1=on: on-screen debug overlay while streaming
     int deadzone = 0;   // stick deadzone: index into kDeadzoneLabels/Values
+    int nexus = 0;      // Xbox guide button combo: index into kNexusLabels
 };
 
 constexpr int kLanguageCount = 14;
 constexpr int kVibrationLevels = 4;
 constexpr int kDeadzoneLevels = 5;
+constexpr int kNexusModes = 4;
 
 Settings load_settings();
 void save_settings(const Settings& settings);
@@ -431,6 +433,7 @@ Settings load_settings() {
     settings.debug_hud = std::clamp(data.value("debug_hud", 0), 0, 1);
     settings.deadzone =
         std::clamp(data.value("deadzone", 0), 0, kDeadzoneLevels - 1);
+    settings.nexus = std::clamp(data.value("nexus", 0), 0, kNexusModes - 1);
     return settings;
 }
 
@@ -446,7 +449,8 @@ void save_settings(const Settings& settings) {
                 {"smooth", settings.smooth},
                 {"sharpness", settings.sharpness},
                 {"debug_hud", settings.debug_hud},
-                {"deadzone", settings.deadzone}}.dump(2);
+                {"deadzone", settings.deadzone},
+                {"nexus", settings.nexus}}.dump(2);
 }
 
 // Streamed console's system language (BCP-47). Games without an in-game
@@ -1043,6 +1047,12 @@ const char* kDeadzoneLabels[kDeadzoneLevels] = {"Off", "Low", "Medium", "High",
                                                 "Very high"};
 const float kDeadzoneValues[kDeadzoneLevels] = {0.0f, 0.08f, 0.15f, 0.22f,
                                                 0.30f};
+// How the Xbox guide (nexus) button is produced. The Switch has no spare
+// physical button for it, so every choice trades away some input (#59):
+// L3 + R3 conflicts with games using both stick clicks, ZL + ZR + Plus
+// leaves the sticks untouched, Hold View delays View taps to release.
+const char* kNexusLabels[kNexusModes] = {"L3 + R3", "ZL + ZR + Plus",
+                                         "Hold View", "Off"};
 
 const HomeConsole& selected_console(const App& app) {
     return app.consoles[std::clamp(
@@ -1505,6 +1515,7 @@ void draw_settings(App& app) {
         {"Video pacing", app.settings.smooth ? "Smooth" : "Standard"},
         {"Sharpness", kSharpnessLabels[app.settings.sharpness]},
         {"Stick deadzone", kDeadzoneLabels[app.settings.deadzone]},
+        {"Xbox button", kNexusLabels[app.settings.nexus]},
     };
     if (!app.consoles.empty())
         rows.push_back({"Preferred source",
@@ -1611,6 +1622,10 @@ void draw_settings(App& app) {
             line2 = "raise this if a stick drifts or creeps on its own at rest.";
             break;
         case 9:
+            line1 = "Which combo presses the Xbox guide button. L3 + R3";
+            line2 = "conflicts with games that use both stick clicks.";
+            break;
+        case 10:
             line1 = "Where Play launches games: xCloud (cloud servers) or";
             line2 = "remote play from your own console over your network.";
             break;
@@ -1664,7 +1679,7 @@ void draw_settings(App& app) {
 // mapping 0: positional (Switch east button -> Xbox east button).
 // mapping 1: match labels (Switch A -> Xbox A).
 xcloud::GamepadFrame read_gamepad(SDL_Joystick* joystick, int mapping,
-                                  float deadzone) {
+                                  float deadzone, int nexus_mode) {
     xcloud::GamepadFrame frame;
     auto button = [&](int index) {
         return SDL_JoystickGetButton(joystick, index) != 0;
@@ -1692,10 +1707,47 @@ xcloud::GamepadFrame read_gamepad(SDL_Joystick* joystick, int mapping,
     frame.dpad_up = button(kBtnUp);
     frame.dpad_right = button(kBtnRight);
     frame.dpad_down = button(kBtnDown);
-    // Both stick clicks together = Xbox nexus (guide).
-    if (frame.left_thumb && frame.right_thumb) {
-        frame.nexus = true;
-        frame.left_thumb = frame.right_thumb = false;
+    // Xbox guide (nexus) button, per the "Xbox button" setting (#59). Every
+    // mode sacrifices a different input; see kNexusLabels.
+    switch (nexus_mode) {
+        case 0:  // both stick clicks together
+            if (frame.left_thumb && frame.right_thumb) {
+                frame.nexus = true;
+                frame.left_thumb = frame.right_thumb = false;
+            }
+            break;
+        case 1:  // ZL + ZR + Plus; stick clicks reach the game untouched
+            if (frame.left_trigger > 0 && frame.right_trigger > 0 &&
+                frame.menu) {
+                frame.nexus = true;
+                frame.menu = false;
+            }
+            break;
+        case 2: {  // hold View ~0.7 s = guide; a short press stays View but
+                   // is delivered on release (held back until the hold is
+                   // known to be short), stretched a few frames so the
+                   // server's edge detector cannot miss it.
+            static Uint32 view_down_since = 0;
+            static int view_tap_frames = 0;
+            bool view_now = frame.view;
+            frame.view = false;
+            Uint32 now = SDL_GetTicks();
+            if (view_now) {
+                if (!view_down_since) view_down_since = now;
+                if (now - view_down_since >= 700) frame.nexus = true;
+            } else {
+                if (view_down_since && now - view_down_since < 700)
+                    view_tap_frames = 4;
+                view_down_since = 0;
+            }
+            if (view_tap_frames > 0) {
+                --view_tap_frames;
+                frame.view = true;
+            }
+            break;
+        }
+        default:  // Off: nothing intercepted, no guide button
+            break;
     }
     auto axis = [&](int index) {
         return SDL_JoystickGetAxis(joystick, index) / 32767.0f;
@@ -1897,7 +1949,8 @@ void draw_stream(App& app, SDL_Joystick* joystick) {
         app.gfx.draw_texture(frame, destination);
         app.engine->send_gamepad(
             read_gamepad(joystick, app.settings.mapping,
-                        kDeadzoneValues[app.settings.deadzone]));
+                        kDeadzoneValues[app.settings.deadzone],
+                        app.settings.nexus));
         apply_rumble(app);
 
         if (SDL_GetTicks() < app.stream_hint_until) {
@@ -2465,9 +2518,9 @@ int main(int argc, char** argv) {
 
             case Scene::Settings: {
                 // Row order: quality, mapping, vibration, region, language,
-                // volume, pacing, sharpness, deadzone, [source when a console
-                // is linked], Debug HUD, accounts, sign out.
-                int hud_row = app.consoles.empty() ? 9 : 10;
+                // volume, pacing, sharpness, deadzone, Xbox button, [source
+                // when a console is linked], Debug HUD, accounts, sign out.
+                int hud_row = app.consoles.empty() ? 10 : 11;
                 int accounts_row = hud_row + 1;
                 int signout_row = hud_row + 2;
                 if (input.up)
@@ -2543,10 +2596,14 @@ int main(int argc, char** argv) {
                             (app.settings.deadzone + direction +
                              kDeadzoneLevels) %
                             kDeadzoneLevels;
+                    else if (app.settings_cursor == 9)
+                        app.settings.nexus =
+                            (app.settings.nexus + direction + kNexusModes) %
+                            kNexusModes;
                     // "Preferred source" only exists with a linked console;
                     // Debug HUD sits right after it either way. Accounts and
                     // Sign out are A-rows, handled above.
-                    else if (!app.consoles.empty() && app.settings_cursor == 9)
+                    else if (!app.consoles.empty() && app.settings_cursor == 10)
                         app.settings.source =
                             (app.settings.source + direction + 3) % 3;
                     else if (app.settings_cursor == hud_row)
@@ -2726,7 +2783,8 @@ int main(int argc, char** argv) {
             if (now - app.last_input_ms >= 8) {
                 app.engine->send_gamepad(
                     read_gamepad(joystick, app.settings.mapping,
-                        kDeadzoneValues[app.settings.deadzone]));
+                        kDeadzoneValues[app.settings.deadzone],
+                        app.settings.nexus));
                 apply_rumble(app);
                 app.last_input_ms = now;
             }
