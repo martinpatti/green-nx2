@@ -1011,6 +1011,7 @@ bool Engine::run_peer(GssvSession& session) {
     Uint64 prev_hud_time = SDL_GetTicks64();
     Uint64 idr_wait_start = 0;
     Uint64 last_idr_wait_log = 0;
+    bool decode_stall_resynced = false;  // one jitter reset per decode stall
     Uint64 negotiation_started = SDL_GetTicks64();
     Uint64 last_loop_tick = SDL_GetTicks64();  // detects a suspended app
     bool opened_channels = false;
@@ -1128,6 +1129,27 @@ bool Engine::run_peer(GssvSession& session) {
             // last_decode is written on the decode thread's own SDL_GetTicks64()
             // call, not this (worker) thread's -- guard the same underflow risk
             // as the keepalive watchdog above.
+            // Escalation before giving up (#45): five seconds of units going
+            // in with nothing decoded means the decoder is swallowing garbage
+            // (corrupt assembly after a loss burst, or hwaccel poisoned by a
+            // garbage SPS). Wipe the assembler and gate on a clean IDR: only
+            // a verified keyframe reaches the decoder from here, and its SPS
+            // re-runs hwaccel setup with sane dimensions. One shot per stall,
+            // re-armed once decoding resumes.
+            if (last_decode && now > last_decode) {
+                if (now - last_decode > 5000 && !decode_stall_resynced) {
+                    decode_stall_resynced = true;
+                    {
+                        std::lock_guard<std::timed_mutex> lock(peer_mutex_);
+                        jitter_.reset();
+                        request_keyframe_locked();
+                    }
+                    log("video decode stalled 5s: jitter reset, waiting for "
+                        "a clean IDR");
+                } else if (now - last_decode <= 5000) {
+                    decode_stall_resynced = false;
+                }
+            }
             if (last_decode && now > last_decode &&
                 now - last_decode > 15000) {
                 fail("Video stalled for 15s, please start the stream again");
@@ -1348,6 +1370,16 @@ void Engine::decode_loop() {
         // Recover from packet loss / corrupt frames with a fresh keyframe
         // (throttled) instead of staying blocky until the next periodic IDR.
         if (video_.take_error()) request_keyframe();
+        // Garbage in, nothing out (#45): ffmpeg swallows corrupt AUs with
+        // warnings only -- send_packet succeeds and no corrupt frame is ever
+        // emitted, so take_error() never latches while the picture is dead.
+        // If units keep arriving but nothing has decoded for 2 s, ask for a
+        // keyframe ourselves (request_keyframe self-throttles to 1/s).
+        if (got_frame_) {
+            Uint64 last = last_decode_ticks_.load(std::memory_order_relaxed);
+            Uint64 now = SDL_GetTicks64();
+            if (last && now > last && now - last > 2000) request_keyframe();
+        }
     }
 }
 #endif
