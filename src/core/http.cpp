@@ -108,9 +108,23 @@ HttpResponse Http::request(const char* method, const std::string& url,
 
     CURLcode code = curl_easy_perform(curl);
     if (list) curl_slist_free_all(list);
-    if (code != CURLE_OK)
+    if (code != CURLE_OK) {
+        // For TLS failures, name the address the console actually reached: a
+        // DNS/hosts block presenting its own certificate then reads as "cert
+        // not OK via 127.0.0.1" instead of a guessing game (#58). Only for
+        // TLS-class errors -- there a connection certainly happened on THIS
+        // attempt, so the handle's last-connection info cannot be stale.
+        std::string peer;
+        if (code == CURLE_PEER_FAILED_VERIFICATION ||
+            code == CURLE_SSL_CONNECT_ERROR) {
+            char* peer_ip = nullptr;
+            curl_easy_getinfo(curl, CURLINFO_PRIMARY_IP, &peer_ip);
+            if (peer_ip && *peer_ip) peer = std::string(" via ") + peer_ip;
+        }
         throw std::runtime_error(std::string("HTTP request failed: ") +
-                                 curl_easy_strerror(code) + " (" + url + ")");
+                                 curl_easy_strerror(code) + " (" + url + peer +
+                                 ")");
+    }
 
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status);
     return response;
