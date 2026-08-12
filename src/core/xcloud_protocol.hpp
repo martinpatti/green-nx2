@@ -57,6 +57,7 @@ private:
 // ---- control / message channel JSON ---------------------------------------
 std::string authorization_request();
 std::string gamepad_changed(uint8_t index, bool was_added);
+std::string user_requested_resolution(const char* alias);
 std::string video_keyframe_requested();
 std::string message_handshake();
 bool is_handshake_ack(const std::string& payload);

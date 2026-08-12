@@ -113,6 +113,16 @@ std::string video_keyframe_requested() {
         .dump();
 }
 
+std::string user_requested_resolution(const char* alias) {
+    // The official client's resolution picker, verbatim (bundle-verified).
+    // Alias enum: Auto / 720 / 720HQ / 1080 / 1080HQ / 1440. Without this the
+    // server free-picks 1440p on supporting titles for desktop-class clients,
+    // which a stock Switch cannot sustain (#60).
+    return json{{"message", "userRequestedResolutionUpdate"},
+                {"resolutionAlias", alias}}
+        .dump();
+}
+
 std::string message_handshake() {
     return json{{"type", "Handshake"},
                 {"version", "messageV1"},

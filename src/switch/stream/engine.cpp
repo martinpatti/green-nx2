@@ -504,6 +504,14 @@ void Engine::handle_channel_message(uint16_t sid, const char* data,
             // gamepad, then declare client capabilities (our quality lever).
             send_on_channel_locked("control", xcloud::authorization_request());
             send_on_channel_locked("control", xcloud::gamepad_changed(0, true));
+            // Pin the stream to the tier's resolution the way the official
+            // client does. Ignored by servers that predate the picker, so the
+            // worst case is today's behavior.
+            send_on_channel_locked(
+                "control", xcloud::user_requested_resolution(
+                               tier_ == QualityTier::P720     ? "720"
+                               : tier_ == QualityTier::P1080  ? "1080"
+                                                              : "1080HQ"));
             TierProfile profile = tier_profile(tier_);
             for (const std::string& message : xcloud::startup_messages(
                      profile.width, profile.height, profile.bitrate_kbps,
@@ -1027,7 +1035,11 @@ bool Engine::run_peer(GssvSession& session) {
         bool drained_any = false;
         {
             std::lock_guard<std::timed_mutex> lock(peer_mutex_);
-            for (int i = 0; peer_ && i < 64; ++i) {
+            // Batch of 16, not 64: under heavy streams the worker gets
+            // preempted mid-batch while holding the lock, and the input
+            // thread starves behind it (#60). Smaller batches release the
+            // lock 4x as often at negligible drain overhead.
+            for (int i = 0; peer_ && i < 16; ++i) {
                 if (peer_connection_loop(peer_) > 0)
                     drained_any = true;
                 else
@@ -1524,8 +1536,11 @@ void Engine::send_gamepad(const xcloud::GamepadFrame& frame) {
     // while holding peer_mutex_, an unbounded lock here froze presentation,
     // input polling and the exit combo with it (#45). Dropping one 125 Hz
     // full-state frame is invisible; freezing the app is not.
+    // Budget = one full input cadence step (main loop sends every 8 ms): a
+    // frame that waited 8 ms is still on time for its slot, and under heavy
+    // streams the 4 ms budget starved half the frames away (#60).
     std::unique_lock<std::timed_mutex> lock(peer_mutex_, std::defer_lock);
-    if (!lock.try_lock_for(std::chrono::milliseconds(4))) {
+    if (!lock.try_lock_for(std::chrono::milliseconds(8))) {
         input_drop_lock_++;
         return;
     }
