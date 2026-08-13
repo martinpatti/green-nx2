@@ -187,6 +187,9 @@ private:
     // Set when the server sends serverInitiatedDisconnect (stream stopped on
     // the console, console powering off, another client took over).
     std::atomic<bool> server_ended_{false};
+    // run_peer -> worker: the datachannel died mid-stream (#61), retry with
+    // a fresh session on the reconnect budget instead of the dead-path one.
+    std::atomic<bool> reconnect_requested_{false};
     // Last RTP arrival, video or audio (peer thread). run_peer's stall
     // watchdog uses it to end a stream whose media path died silently.
     std::atomic<Uint64> last_media_ticks_{0};

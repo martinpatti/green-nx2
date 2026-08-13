@@ -645,6 +645,11 @@ void Engine::worker() {
         // came back up, so home gets more tries than a wake-up alone needs.
         int attempts = home ? 6 : 2;
         bool registering = false;  // last failure was "still registering"
+        // Mid-stream reconnects (#61) get their own budget: a stream that was
+        // up and healthy almost always comes straight back on a fresh
+        // session, but a network that kills SCTP every minute must not loop
+        // forever.
+        int midstream_reconnects = 0;
         for (int attempt = 0; attempt < attempts && !quit_; ++attempt) {
             if (attempt > 0) {
                 std::string of = " (attempt " + std::to_string(attempt + 1) +
@@ -722,11 +727,22 @@ void Engine::worker() {
             session.stop();
             if (quit_) return;
             if (retry_transport) {
-                if (attempt == attempts - 1) {
+                bool reconnect = reconnect_requested_.exchange(false);
+                if (reconnect) {
+                    if (++midstream_reconnects > 3) {
+                        fail("The connection keeps dropping, please start "
+                             "the stream again");
+                        return;
+                    }
+                    log("reconnecting after datachannel death (" +
+                        std::to_string(midstream_reconnects) + "/3)");
+                    attempt = -1;  // not a dead path: restart that budget
+                } else if (attempt == attempts - 1) {
                     fail("The server's media connection never came up");
                     return;
+                } else {
+                    log("retrying with a fresh session (dead media path)");
                 }
-                log("retrying with a fresh session (dead media path)");
                 {
                     // Dispose of the dead attempt's peer (normally stop()'s
                     // job) so the next run_peer starts from scratch.
@@ -736,6 +752,16 @@ void Engine::worker() {
                         peer_connection_destroy(peer_);
                         peer_ = nullptr;
                     }
+                }
+                if (reconnect) {
+                    // Re-arm the stream-side state that only start_common
+                    // normally resets: with got_frame_ still true the video
+                    // watchdogs would misread the old stream's timestamps
+                    // and kill the fresh session while it negotiates.
+                    got_frame_ = false;
+                    last_media_ticks_ = 0;
+                    last_decode_ticks_ = 0;
+                    jitter_.reset();
                 }
                 peer_state_ = PEER_CONNECTION_NEW;
                 channels_open_ = false;
@@ -1020,6 +1046,7 @@ bool Engine::run_peer(GssvSession& session) {
     Uint64 idr_wait_start = 0;
     Uint64 last_idr_wait_log = 0;
     bool decode_stall_resynced = false;  // one jitter reset per decode stall
+    int input_dead_seconds = 0;          // consecutive all-fail input seconds
     Uint64 negotiation_started = SDL_GetTicks64();
     Uint64 last_loop_tick = SDL_GetTicks64();  // detects a suspended app
     bool opened_channels = false;
@@ -1283,10 +1310,30 @@ bool Engine::run_peer(GssvSession& session) {
                     std::lock_guard<std::mutex> input_lock(input_mutex_);
                     input_seq = input_.sequence();
                 }
-                log("input| sent=" + std::to_string(input_sent_.exchange(0)) +
-                    " drop=" + std::to_string(input_drop_lock_.exchange(0)) +
-                    " fail=" + std::to_string(input_send_fail_.exchange(0)) +
+                uint32_t in_sent = input_sent_.exchange(0);
+                uint32_t in_drop = input_drop_lock_.exchange(0);
+                uint32_t in_fail = input_send_fail_.exchange(0);
+                log("input| sent=" + std::to_string(in_sent) +
+                    " drop=" + std::to_string(in_drop) +
+                    " fail=" + std::to_string(in_fail) +
                     " seq=" + std::to_string(input_seq));
+                // Dead datachannel (#61): a big lag spike can kill the SCTP
+                // association outright ("sctp not connected"); usrsctp never
+                // recovers it, so media keeps flowing while input/control are
+                // gone for good. Nothing-sent-and-everything-failing three
+                // seconds straight is that signature; hand the session back
+                // to worker() for a fresh one instead of streaming a picture
+                // the user cannot control.
+                if (in_sent == 0 && in_fail > 0) {
+                    if (++input_dead_seconds >= 3) {
+                        log("input channel dead for 3s (sctp): reconnecting");
+                        set_status("Reconnecting...");
+                        reconnect_requested_ = true;
+                        return false;
+                    }
+                } else {
+                    input_dead_seconds = 0;
+                }
             }
         }
 
