@@ -176,6 +176,8 @@ void Engine::start_common(const std::string& title_id, QualityTier tier,
     channels_open_ = false;
     handshake_done_ = false;
     server_ended_ = false;
+    reconnect_requested_ = false;
+    resuming_ = false;
     last_media_ticks_ = 0;
     worker_tick_ = 0;
     input_sent_ = 0;
@@ -737,6 +739,13 @@ void Engine::worker() {
                     log("reconnecting after datachannel death (" +
                         std::to_string(midstream_reconnects) + "/3)");
                     attempt = -1;  // not a dead path: restart that budget
+                    // Pin state_ to Streaming for the whole reconnect. If it
+                    // leaves, the main loop's deko hand-off quiesces the
+                    // engine (the #33 guard) and aborts our session request
+                    // via the HTTP quit_ flag -- pre2 died exactly there.
+                    // The user keeps the last frame on screen until the
+                    // replacement session delivers.
+                    resuming_ = true;
                 } else if (attempt == attempts - 1) {
                     fail("The server's media connection never came up");
                     return;
@@ -762,11 +771,16 @@ void Engine::worker() {
                     last_media_ticks_ = 0;
                     last_decode_ticks_ = 0;
                     jitter_.reset();
+                    // The dead session's undecoded tail would only confuse
+                    // the decoder before the replacement's first IDR.
+                    std::lock_guard<std::mutex> video_lock(video_mutex_);
+                    video_queue_.clear();
                 }
                 peer_state_ = PEER_CONNECTION_NEW;
                 channels_open_ = false;
                 handshake_done_ = false;
-                state_ = EngineState::StartingSession;  // back to connect UI
+                if (!resuming_)
+                    state_ = EngineState::StartingSession;  // back to connect UI
                 continue;
             }
             // Both of these mean "the console is not ready yet, ask again":
@@ -803,7 +817,7 @@ void Engine::worker() {
 }
 
 bool Engine::run_peer(GssvSession& session) {
-    state_ = EngineState::Negotiating;
+    if (!resuming_) state_ = EngineState::Negotiating;
     set_status("Negotiating connection...");
 
     PeerConfiguration config{};
@@ -1123,7 +1137,9 @@ bool Engine::run_peer(GssvSession& session) {
             log("ICE connected but DTLS/SCTP never completed -- dead media path");
             return false;
         }
-        if (state_ == EngineState::Negotiating &&
+        // During a mid-stream reconnect state_ stays pinned to Streaming, so
+        // the resuming_ leg keeps this timeout armed for that attempt too.
+        if ((state_ == EngineState::Negotiating || resuming_) &&
             SDL_GetTicks64() - negotiation_started > 45000) {
             fail("Connection timed out");
             return true;
@@ -1424,6 +1440,7 @@ void Engine::decode_loop() {
             if (!got_frame_) {
                 got_frame_ = true;
                 state_ = EngineState::Streaming;
+                resuming_ = false;  // replacement session delivered
             }
         }
         // Recover from packet loss / corrupt frames with a fresh keyframe
@@ -1543,6 +1560,7 @@ SDL_Texture* Engine::pump_video() {
         if (video_.decode(unit.data(), unit.size()) && !got_frame_) {
             got_frame_ = true;
             state_ = EngineState::Streaming;
+            resuming_ = false;  // replacement session delivered
         }
     }
     if (video_.take_error()) request_keyframe();

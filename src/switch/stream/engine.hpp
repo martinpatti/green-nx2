@@ -190,6 +190,12 @@ private:
     // run_peer -> worker: the datachannel died mid-stream (#61), retry with
     // a fresh session on the reconnect budget instead of the dead-path one.
     std::atomic<bool> reconnect_requested_{false};
+    // True while a mid-stream reconnect is replacing the session. state_ must
+    // stay Streaming for its whole duration: the moment it leaves, the main
+    // loop's deko hand-off quiesces the engine (stop(), the #33 guard) and
+    // aborts the very session request the reconnect depends on. Cleared when
+    // the replacement session decodes its first frame.
+    std::atomic<bool> resuming_{false};
     // Last RTP arrival, video or audio (peer thread). run_peer's stall
     // watchdog uses it to end a stream whose media path died silently.
     std::atomic<Uint64> last_media_ticks_{0};
