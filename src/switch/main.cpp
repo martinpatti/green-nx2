@@ -293,7 +293,7 @@ struct Settings {
     int nexus = 0;      // Xbox guide button combo: index into kNexusLabels
 };
 
-constexpr int kLanguageCount = 14;
+constexpr int kLanguageCount = 30;
 constexpr int kVibrationLevels = 4;
 constexpr int kDeadzoneLevels = 5;
 constexpr int kNexusModes = 4;
@@ -457,17 +457,26 @@ void save_settings(const Settings& settings) {
 }
 
 // Streamed console's system language (BCP-47). Games without an in-game
-// language menu inherit this; sent as the session "locale". Native labels are
-// limited to scripts the Switch Standard shared font can render (Latin,
-// Cyrillic, Japanese) -- Korean/Chinese need fonts we don't load.
+// language menu inherit this; sent as the session "locale". The set mirrors
+// what xCloud accepts (better-xcloud's preferred-game-language list, the same
+// mechanism). The font only constrains the LABEL, not the stream (#63):
+// scripts the Switch Standard shared font may not render (Korean, Chinese,
+// Thai, Arabic...) get English/Latin labels, like Russian and Japanese
+// always did. Saved settings index into these arrays, so new entries only
+// ever go at the end.
 const char* kLanguageLabels[kLanguageCount] = {
     "English (US)", "English (UK)", "Español (España)", "Español (México)",
     "Français", "Deutsch", "Italiano", "Português (Brasil)",
     "Português (Portugal)", "Polski", "Nederlands", "Türkçe",
-    "Russian", "Japanese"};
+    "Russian", "Japanese",
+    "Arabic", "Bulgarian", "Chinese (Simplified)", "Chinese (Traditional)",
+    "Czech", "Dansk", "Greek", "Hebrew", "Korean", "Magyar",
+    "Norsk", "Romanian", "Slovak", "Suomi", "Svenska", "Thai"};
 const char* kLanguageCodes[kLanguageCount] = {
     "en-US", "en-GB", "es-ES", "es-MX", "fr-FR", "de-DE", "it-IT",
-    "pt-BR", "pt-PT", "pl-PL", "nl-NL", "tr-TR", "ru-RU", "ja-JP"};
+    "pt-BR", "pt-PT", "pl-PL", "nl-NL", "tr-TR", "ru-RU", "ja-JP",
+    "ar-SA", "bg-BG", "zh-CN", "zh-TW", "cs-CZ", "da-DK", "el-GR", "he-IL",
+    "ko-KR", "hu-HU", "nb-NO", "ro-RO", "sk-SK", "fi-FI", "sv-SE", "th-TH"};
 
 // Rumble intensity. HD rumble at amplitude 1.0 is very strong and audibly hums,
 // so even "High" leaves headroom rather than driving the actuators flat out.
