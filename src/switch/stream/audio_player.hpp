@@ -41,6 +41,15 @@ public:
     // thread. Returns immediately; safe to call from the network thread.
     void submit(uint16_t seq, const uint8_t* data, size_t size);
 
+    // Forget the current stream without tearing the device down: a mid-stream
+    // reconnect replaces the RTP source, whose random starting sequence the
+    // reorder buffer would otherwise reject wholesale (see
+    // AudioJitterBuffer::reset) and whose Opus state shares nothing with the
+    // old stream's. Queued audio from the dead stream is dropped. Safe to
+    // call from any thread; the reset itself runs on the decode thread, which
+    // owns that state.
+    void resync();
+
     int device_hz() const { return device_hz_; }
 
     // Output volume multiplier applied to decoded PCM (1.0 = unchanged). Safe to
@@ -108,6 +117,7 @@ private:
     std::thread thread_;
     std::thread out_thread_;
     std::atomic<bool> quit_{false};
+    std::atomic<bool> resync_requested_{false};  // see resync()
     std::mutex inbox_mutex_;
     std::condition_variable cv_;
     struct InPacket {

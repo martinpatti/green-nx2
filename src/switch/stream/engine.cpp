@@ -726,73 +726,109 @@ void Engine::worker() {
                     session.connect(auth_.fetch_passport_token());
                     connected = true;
                 } else if (state == SessionState::Provisioned) {
-                    if (run_peer(session)) {
+                    bool peer_ok = false;
+                    bool resignal_refused = false;
+                    if (resuming_) {
+                        // A re-signal can be refused outright (the server
+                        // already tore the session down); that is fallback
+                        // material, not a hard failure to surface.
+                        try {
+                            peer_ok = run_peer(session);
+                        } catch (const std::exception& error) {
+                            log(std::string("re-signal failed: ") +
+                                error.what());
+                            resignal_refused = true;
+                        }
+                    } else {
+                        peer_ok = run_peer(session);
+                    }
+                    if (peer_ok) {
                         session.stop();
                         return;
                     }
-                    // Dead media path: retry with a fresh session; only the
-                    // last attempt surfaces a failure to the user.
+                    if (!resignal_refused &&
+                        reconnect_requested_.exchange(false)) {
+                        // Mid-stream reconnect (#61): keep the SAME session,
+                        // the way the official client recovers. The backend
+                        // flips a surviving session back to a connectable
+                        // state and accepts a fresh SDP/ICE exchange into the
+                        // same sessionPath -- no new allocation, so none of
+                        // the "waiting for resources" queue that made the
+                        // fresh-session reconnect take 40 s. The fresh
+                        // session below stays as the fallback for a session
+                        // the server has already given up on.
+                        if (++midstream_reconnects > 3) {
+                            fail("The connection keeps dropping, please "
+                                 "start the stream again");
+                            session.stop();
+                            return;
+                        }
+                        log("reconnecting after datachannel death (" +
+                            std::to_string(midstream_reconnects) +
+                            "/3): re-signaling the same session");
+                        resuming_ = true;
+                        rearm_for_resume();
+                        set_status("Reconnecting...");
+                        connected = false;  // re-auth if it asks again
+                        polls_in_state = 0;
+                        continue;
+                    }
+                    // Dead media path (or a refused re-signal): retry with a
+                    // fresh session; only the last attempt surfaces a
+                    // failure to the user.
                     retry_transport = true;
                     break;
                 } else if (state == SessionState::Failed) {
+                    if (resuming_) {
+                        // The server declared the session dead while we were
+                        // re-signaling into it -- what the official client
+                        // logs as "not recoverable". Fall back to a fresh
+                        // session instead of surfacing an error mid-freeze.
+                        log("resumed session unrecoverable: " +
+                            session.error_details());
+                        retry_transport = true;
+                        break;
+                    }
                     session_error = session.error_details();
                     break;
                 }
-                int cap = state == SessionState::WaitingForResources
+                // While resuming, cap every state near the official client's
+                // ~20 s reconnect window: the user is staring at a frozen
+                // frame, and the fresh-session fallback beats an open-ended
+                // wait on a session that is not coming back.
+                int cap = resuming_                                     ? 30
+                          : state == SessionState::WaitingForResources
                               ? 2570   // ~30 min in the allocation queue
                               : 300;   // ~3.5 min for states that should move
-                if (++polls_in_state >= cap) break;
+                if (++polls_in_state >= cap) {
+                    if (resuming_) retry_transport = true;
+                    break;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(700));
             }
             session.stop();
             if (quit_) return;
             if (retry_transport) {
-                bool reconnect = reconnect_requested_.exchange(false);
-                if (reconnect) {
-                    if (++midstream_reconnects > 3) {
-                        fail("The connection keeps dropping, please start "
-                             "the stream again");
-                        return;
-                    }
-                    log("reconnecting after datachannel death (" +
-                        std::to_string(midstream_reconnects) + "/3)");
-                    attempt = -1;  // not a dead path: restart that budget
-                    // Pin state_ to Streaming for the whole reconnect. If it
-                    // leaves, the main loop's deko hand-off quiesces the
-                    // engine (the #33 guard) and aborts our session request
-                    // via the HTTP quit_ flag -- pre2 died exactly there.
-                    // The user keeps the last frame on screen until the
-                    // replacement session delivers.
-                    resuming_ = true;
-                } else if (attempt == attempts - 1) {
+                reconnect_requested_ = false;  // consumed with this attempt
+                if (attempt == attempts - 1) {
                     fail("The server's media connection never came up");
                     return;
-                } else {
-                    log("retrying with a fresh session (dead media path)");
                 }
+                log(resuming_ ? "falling back to a fresh session"
+                              : "retrying with a fresh session (dead media "
+                                "path)");
                 {
                     // Dispose of the dead attempt's peer (normally stop()'s
-                    // job) so the next run_peer starts from scratch.
+                    // job) so the next run_peer starts from scratch. On the
+                    // resume fallback the stream state is already re-armed;
+                    // the attempt bump below buys the cool-down the fresh
+                    // request needs to dodge "waiting for resources".
                     std::lock_guard<std::timed_mutex> lock(peer_mutex_);
                     if (peer_) {
                         peer_connection_close(peer_);
                         peer_connection_destroy(peer_);
                         peer_ = nullptr;
                     }
-                }
-                if (reconnect) {
-                    // Re-arm the stream-side state that only start_common
-                    // normally resets: with got_frame_ still true the video
-                    // watchdogs would misread the old stream's timestamps
-                    // and kill the fresh session while it negotiates.
-                    got_frame_ = false;
-                    last_media_ticks_ = 0;
-                    last_decode_ticks_ = 0;
-                    jitter_.reset();
-                    // The dead session's undecoded tail would only confuse
-                    // the decoder before the replacement's first IDR.
-                    std::lock_guard<std::mutex> video_lock(video_mutex_);
-                    video_queue_.clear();
                 }
                 peer_state_ = PEER_CONNECTION_NEW;
                 channels_open_ = false;
@@ -832,6 +868,57 @@ void Engine::worker() {
     } catch (const std::exception& error) {
         fail(error.what());
     }
+}
+
+void Engine::rearm_for_resume() {
+    {
+        // Dispose of the dead peer first: with it gone, no media callback can
+        // race the re-arm below.
+        std::lock_guard<std::timed_mutex> lock(peer_mutex_);
+        if (peer_) {
+            peer_connection_close(peer_);
+            peer_connection_destroy(peer_);
+            peer_ = nullptr;
+        }
+    }
+    // Stale got_frame_/tick state would let the video watchdogs misread the
+    // old stream's timestamps and kill the fresh transport while it
+    // negotiates.
+    got_frame_ = false;
+    last_media_ticks_ = 0;
+    last_decode_ticks_ = 0;
+    jitter_.reset();
+    {
+        // Drop the dead session's undecoded tail, and tell the decode thread
+        // that any AU it already popped belongs to the dead stream (see
+        // stream_gen_): a late decode of one must not set got_frame_ or clear
+        // resuming_.
+        std::lock_guard<std::mutex> lock(video_mutex_);
+        video_queue_.clear();
+        stream_gen_.fetch_add(1, std::memory_order_relaxed);
+    }
+#ifdef __SWITCH__
+    {
+        // Old-stream frames queued for Smooth pacing would pin decoder-pool
+        // surfaces for the whole reconnect and then play first once the new
+        // stream decodes. present_frame_ is deliberately kept: it is what
+        // pump_video holds on screen, under the reconnect notice, until the
+        // replacement delivers.
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        for (SmoothFrame& queued : smooth_frames_)
+            if (queued.frame) av_frame_free(&queued.frame);
+        smooth_frames_.clear();
+        shared_frame_valid_ = false;
+    }
+#endif
+    // The new transport's audio starts at a random RTP sequence and a fresh
+    // Opus state; without a resync the reorder buffer's RFC1982 gate can
+    // drop the entire new stream (see AudioJitterBuffer::reset).
+    audio_.resync();
+    video_bytes_ = 0;  // HUD bitrate window restarts with the new transport
+    peer_state_ = PEER_CONNECTION_NEW;
+    channels_open_ = false;
+    handshake_done_ = false;
 }
 
 bool Engine::run_peer(GssvSession& session) {
@@ -1400,6 +1487,7 @@ bool Engine::run_peer(GssvSession& session) {
 void Engine::decode_loop() {
     while (!quit_) {
         std::vector<uint8_t> unit;
+        uint32_t gen;
         {
             std::unique_lock<std::mutex> lock(video_mutex_);
             video_cv_.wait_for(lock, std::chrono::milliseconds(20), [this] {
@@ -1409,8 +1497,15 @@ void Engine::decode_loop() {
             if (video_queue_.empty()) continue;
             unit = std::move(video_queue_.front());
             video_queue_.pop_front();
+            gen = stream_gen_.load(std::memory_order_relaxed);
         }
         if (video_.decode(unit.data(), unit.size())) {
+            // A mid-stream reconnect re-armed while this AU was in flight:
+            // the frame belongs to the dead stream. Publishing it, or letting
+            // it set got_frame_, would clear resuming_ early -- unpinning
+            // state_ and handing the engine to the main loop's quiesce path
+            // in the middle of the reconnect.
+            if (gen != stream_gen_.load(std::memory_order_relaxed)) continue;
             // Detect the source cadence from decode spacing: ~16 ms gaps mean
             // a 60 fps stream (present every refresh), ~33 ms mean 30 fps
             // (present every other refresh). Streaks of 8 debounce the flips
@@ -1499,12 +1594,26 @@ SDL_Texture* Engine::pump_video() {
     const double interval =
         static_cast<double>(SDL_GetPerformanceFrequency()) / kDisplayHz;
     double now = static_cast<double>(SDL_GetPerformanceCounter());
-    if (dk_video_.initialized() && got_frame_ && now >= next_present_counter_) {
+    // During a mid-stream reconnect the present loop must keep running with
+    // got_frame_ down: re-presenting the dead stream's last frame is what
+    // carries the "Reconnecting..." notice to the screen -- without it the
+    // user stares at a silent freeze and force-quits seconds before the
+    // replacement session delivers (that is how pre3 died in testing).
+    bool resuming = resuming_.load(std::memory_order_relaxed);
+    dk_video_.set_notice(resuming ? status() : std::string());
+    if (dk_video_.initialized() && (got_frame_ || resuming) &&
+        now >= next_present_counter_) {
         AVFrame* frame = nullptr;
         uint64_t frame_seq = 0;
         {
             std::lock_guard<std::mutex> lock(frame_mutex_);
-            if (pacing_ == VideoPacing::Smooth) {
+            if (!got_frame_) {
+                // Resuming: hold whatever was last on screen.
+                if (present_frame_ && present_frame_->data[0]) {
+                    frame = present_frame_;
+                    frame_seq = last_present_seq_;
+                }
+            } else if (pacing_ == VideoPacing::Smooth) {
                 uint32_t period =
                     source_refresh_period_.load(std::memory_order_relaxed);
                 bool due = !smooth_have_present_ ||
@@ -1569,13 +1678,16 @@ SDL_Texture* Engine::pump_video() {
     // so decode inline and hand back the SDL texture.
     for (;;) {
         std::vector<uint8_t> unit;
+        uint32_t gen;
         {
             std::lock_guard<std::mutex> lock(video_mutex_);
             if (video_queue_.empty()) break;
             unit = std::move(video_queue_.front());
             video_queue_.pop_front();
+            gen = stream_gen_.load(std::memory_order_relaxed);
         }
-        if (video_.decode(unit.data(), unit.size()) && !got_frame_) {
+        if (video_.decode(unit.data(), unit.size()) && !got_frame_ &&
+            gen == stream_gen_.load(std::memory_order_relaxed)) {
             got_frame_ = true;
             state_ = EngineState::Streaming;
             resuming_ = false;  // replacement session delivered

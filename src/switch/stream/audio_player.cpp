@@ -107,6 +107,14 @@ void AudioPlayer::shutdown() {
     }
 }
 
+void AudioPlayer::resync() {
+    {
+        std::lock_guard<std::mutex> lock(inbox_mutex_);
+        inbox_.clear();  // still-queued packets belong to the dead stream
+    }
+    resync_requested_ = true;
+}
+
 void AudioPlayer::submit(uint16_t seq, const uint8_t* data, size_t size) {
     {
         std::lock_guard<std::mutex> lock(inbox_mutex_);
@@ -124,6 +132,26 @@ void AudioPlayer::thread_main() {
             cv_.wait_for(lock, std::chrono::milliseconds(5),
                          [this] { return quit_.load() || !inbox_.empty(); });
             batch.swap(inbox_);
+        }
+        if (resync_requested_.exchange(false)) {
+            // Mid-stream reconnect: every piece of per-stream state below is
+            // owned by this thread (init() resets the same set), so the reset
+            // runs here rather than on the caller's thread. The ring is
+            // cleared under its lock so the output thread flips to silence
+            // instead of draining the dead stream's tail; primed_ makes
+            // playback wait for the prebuffer again, as on a fresh stream.
+            batch.clear();  // swapped out alongside the flag: dead stream's
+            reorder_.reset();
+            opus_decoder_ctl(decoder_, OPUS_RESET_STATE);
+            depth_ema_ = 0.0f;
+            servo_adj_ = 0.0f;
+            resample_pos_ = 0.0f;
+            carry_[0] = carry_[1] = 0;
+            adj_ppm_ = 0;
+            ema_ms_ = 0;
+            std::lock_guard<std::mutex> lock(ring_mutex_);
+            read_ = write_ = count_ = 0;
+            primed_ = false;
         }
         for (auto& p : batch)
             reorder_.push(p.seq, p.data.data(), p.data.size());

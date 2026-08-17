@@ -132,6 +132,11 @@ private:
     // then retries once with a fresh session. Every other outcome, including
     // ordinary failures, returns true.
     bool run_peer(GssvSession& session);
+    // Mid-stream reconnect (#61): tears down the dead attempt's peer and
+    // re-arms every piece of stream-side state that only start_common
+    // normally resets, so the replacement transport negotiates against a
+    // clean slate while state_ stays pinned to Streaming. Worker thread.
+    void rearm_for_resume();
     void set_status(const std::string& status);
     void end_session();  // server closed the session: stop, not fail
     void fail(const std::string& error);
@@ -201,6 +206,13 @@ private:
     // aborts the very session request the reconnect depends on. Cleared when
     // the replacement session decodes its first frame.
     std::atomic<bool> resuming_{false};
+    // Bumped by rearm_for_resume() under video_mutex_. An AU popped from the
+    // queue carries the generation it was popped under; a decode that
+    // finishes with a stale generation belongs to the dead stream and must
+    // not publish a frame or set got_frame_ -- doing so would clear resuming_
+    // early, unpin state_, and let the main loop quiesce the engine in the
+    // middle of the reconnect.
+    std::atomic<uint32_t> stream_gen_{0};
     // Last RTP arrival, video or audio (peer thread). run_peer's stall
     // watchdog uses it to end a stream whose media path died silently.
     std::atomic<Uint64> last_media_ticks_{0};

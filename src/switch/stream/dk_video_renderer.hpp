@@ -14,6 +14,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -52,6 +53,17 @@ public:
 
     // Enable/disable the debug HUD overlay pass (drawn on top of the video).
     void set_hud_enabled(bool e) { hud_enabled_ = e; }
+
+    // Status line drawn over the video regardless of the HUD setting -- how a
+    // mid-stream reconnect tells the user the frozen frame is being worked
+    // on. Empty string turns it off. Safe from any thread; the render thread
+    // picks it up on the next present.
+    void set_notice(const std::string& text) {
+        std::lock_guard<std::mutex> lock(notice_mutex_);
+        if (notice_ == text) return;
+        notice_ = text;
+        notice_on_.store(!text.empty(), std::memory_order_relaxed);
+    }
 
     // Live network stats for the HUD, fed once per second from the streaming
     // worker thread (stored atomically; read on the render thread).
@@ -161,6 +173,12 @@ private:
     bool warned_not_hw_ = false;
     bool logged_surface_ = false;
     bool hud_enabled_ = false;  // draw the debug HUD overlay pass
+
+    // Reconnect notice (set_notice). notice_on_ lets the render path check
+    // cheaply without taking the mutex on every present.
+    std::mutex notice_mutex_;
+    std::string notice_;
+    std::atomic<bool> notice_on_{false};
 
     // Debug HUD text (stage 1): stats composited on the CPU into a pitch-linear
     // RGBA texture, sampled by hud_fsh_ in the overlay pass.

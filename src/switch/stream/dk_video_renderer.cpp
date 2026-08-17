@@ -557,8 +557,18 @@ void DkVideoRenderer::update_hud(AVFrame* frame) {
         std::snprintf(buf, sizeof(buf), "%dx%d\n%.0f fps", frame->width,
                       frame->height, fps_);
     }
-    if (hud_text_cache_ == buf) return;  // unchanged -> keep the current texture
-    hud_text_cache_ = buf;
+    // The reconnect notice leads; the stats join it only when the debug HUD
+    // is actually on -- a notice alone must not drag the whole HUD in.
+    std::string text;
+    if (notice_on_.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lock(notice_mutex_);
+        text = notice_;
+        if (hud_enabled_) text += std::string("\n") + buf;
+    } else {
+        text = buf;
+    }
+    if (hud_text_cache_ == text) return;  // unchanged -> keep current texture
+    hud_text_cache_ = text;
     rasterize_hud();
 }
 
@@ -615,7 +625,8 @@ bool DkVideoRenderer::render(AVFrame* frame) {
 
     // Recompute HUD stats + re-rasterize the text texture now, while the GPU is
     // idle (render() ends with waitIdle) and before we record any commands.
-    if (hud_enabled_) update_hud(frame);
+    if (hud_enabled_ || notice_on_.load(std::memory_order_relaxed))
+        update_hud(frame);
 
     int slot = queue_.acquireImage(swapchain_);
 
@@ -678,8 +689,8 @@ bool DkVideoRenderer::render(AVFrame* frame) {
     // --- HUD overlay pass (stage 1): sample the rasterized stats texture and
     // alpha-blend it over the video, top-left. Reuses the video vertex shader;
     // hud_fsh_ samples image descriptor #2 through sampler #0. Gated by the
-    // "Debug HUD" setting.
-    if (hud_enabled_) {
+    // "Debug HUD" setting, or forced on while a reconnect notice is showing.
+    if (hud_enabled_ || notice_on_.load(std::memory_order_relaxed)) {
         dk::BlendState hud_blend;
         hud_blend.setColorBlendOp(DkBlendOp_Add);
         hud_blend.setSrcColorBlendFactor(DkBlendFactor_SrcAlpha);
