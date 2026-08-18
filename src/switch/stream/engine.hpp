@@ -226,6 +226,12 @@ private:
     std::atomic<uint32_t> input_sent_{0};
     std::atomic<uint32_t> input_drop_lock_{0};
     std::atomic<uint32_t> input_send_fail_{0};
+    // Server -> client reports on the "input" channel (vibration etc.). The
+    // server accepting our packets while its own input side goes silent is
+    // the only client-visible trace of the server-side input wedge (#61,
+    // second kind) -- sends succeed, so the failure counters above are blind.
+    std::atomic<uint32_t> input_rx_{0};
+    std::atomic<Uint64> input_rx_last_{0};  // tick of the newest such report
 
     VideoDecoder video_;  // width()/height() are render-thread reads only
 #ifdef __SWITCH__

@@ -185,6 +185,8 @@ void Engine::start_common(const std::string& title_id, QualityTier tier,
     input_sent_ = 0;
     input_drop_lock_ = 0;
     input_send_fail_ = 0;
+    input_rx_ = 0;
+    input_rx_last_ = 0;
     peer_state_ = PEER_CONNECTION_NEW;  // previous session left it CLOSED
     pli_sent_ = 0;
     // Cumulative, and the HUD's bitrate window starts from zero in run_peer:
@@ -540,6 +542,10 @@ void Engine::handle_channel_message(uint16_t sid, const char* data,
 }
 
 void Engine::handle_input_report(const uint8_t* data, size_t size) {
+    // Any server-originated input-channel traffic counts as proof the
+    // session's input side is alive (see input_rx_ in the header).
+    input_rx_.fetch_add(1, std::memory_order_relaxed);
+    input_rx_last_.store(SDL_GetTicks64(), std::memory_order_relaxed);
     // Server "input"-channel report. We only act on Vibration (type 128). The
     // wire layout matches the xbox.com/play client (ref: greenlight):
     //   [0]  report type (128 = Vibration)
@@ -916,6 +922,8 @@ void Engine::rearm_for_resume() {
     // drop the entire new stream (see AudioJitterBuffer::reset).
     audio_.resync();
     video_bytes_ = 0;  // HUD bitrate window restarts with the new transport
+    input_rx_ = 0;      // the old transport's server input traffic proves
+    input_rx_last_ = 0; // nothing about the replacement's
     peer_state_ = PEER_CONNECTION_NEW;
     channels_open_ = false;
     handshake_done_ = false;
@@ -1166,6 +1174,13 @@ bool Engine::run_peer(GssvSession& session) {
     Uint64 last_idr_wait_log = 0;
     bool decode_stall_resynced = false;  // one jitter reset per decode stall
     int input_dead_seconds = 0;          // consecutive all-fail input seconds
+    // Server-side input wedge ladder (#61, second kind): burst detector and
+    // one-shot revive/escalation state. See the stats block below.
+    uint32_t prev_audio_lost = 0;   // audio loss counter at the last tick
+    Uint64 revive_due = 0;          // burst seen: revive scheduled for then
+    Uint64 revive_fired_at = 0;     // revive sent, watching for server traffic
+    bool revive_had_baseline = false;  // server rumbled within 15 s pre-burst
+    Uint64 last_revive = 0;         // cooldown between revive attempts
     Uint64 negotiation_started = SDL_GetTicks64();
     Uint64 last_loop_tick = SDL_GetTicks64();  // detects a suspended app
     bool opened_channels = false;
@@ -1434,9 +1449,16 @@ bool Engine::run_peer(GssvSession& session) {
                 uint32_t in_sent = input_sent_.exchange(0);
                 uint32_t in_drop = input_drop_lock_.exchange(0);
                 uint32_t in_fail = input_send_fail_.exchange(0);
+                uint32_t in_rx = input_rx_.exchange(0);
+                Uint64 rx_last = input_rx_last_.load(std::memory_order_relaxed);
                 log("input| sent=" + std::to_string(in_sent) +
                     " drop=" + std::to_string(in_drop) +
                     " fail=" + std::to_string(in_fail) +
+                    " rx=" + std::to_string(in_rx) +
+                    " rxage=" +
+                    (rx_last && now >= rx_last
+                         ? std::to_string((now - rx_last) / 1000) + "s"
+                         : "-") +
                     " seq=" + std::to_string(input_seq));
                 // Dead datachannel (#61): a big lag spike can kill the SCTP
                 // association outright ("sctp not connected"); usrsctp never
@@ -1454,6 +1476,70 @@ bool Engine::run_peer(GssvSession& session) {
                     }
                 } else {
                     input_dead_seconds = 0;
+                }
+                // The second way a controller dies (#61): a loss burst can
+                // wedge the SESSION's input pipeline -- our sends keep
+                // succeeding (so the detector above is blind) while the game
+                // stops seeing them. The only client-visible trace is the
+                // server's own input-channel traffic (vibration) going
+                // silent. Ladder: after the burst settles, re-announce the
+                // pad through the hotplug path (cheap, in-band); if the
+                // server was rumbling before the burst and stays silent
+                // after the revive, hand off to the reconnect machinery.
+                uint32_t lost_delta =
+                    a.lost >= prev_audio_lost ? a.lost - prev_audio_lost : 0;
+                prev_audio_lost = a.lost;
+                if (lost_delta >= 3 && !revive_due && !revive_fired_at &&
+                    now - last_revive > 10000) {
+                    revive_had_baseline =
+                        rx_last && now >= rx_last && now - rx_last < 15000;
+                    revive_due = now + 2000;  // let the burst settle first
+                }
+                if (revive_due && now >= revive_due && handshake_done_) {
+                    revive_due = 0;
+                    last_revive = now;
+                    {
+                        std::lock_guard<std::timed_mutex> lock(peer_mutex_);
+                        if (peer_) {
+                            {
+                                // client_metadata consumes a sequence number;
+                                // a refused send must give it back or the gap
+                                // kills input the #45 way.
+                                std::lock_guard<std::mutex> input_lock(
+                                    input_mutex_);
+                                if (!send_binary_on_channel_locked(
+                                        "input", input_.client_metadata()))
+                                    input_.rollback_sequence();
+                            }
+                            send_on_channel_locked(
+                                "control", xcloud::gamepad_changed(0, false));
+                            send_on_channel_locked(
+                                "control", xcloud::gamepad_changed(0, true));
+                        }
+                    }
+                    revive_fired_at = now;
+                    log(std::string("input revive: pad re-announced after "
+                                    "loss burst") +
+                        (revive_had_baseline
+                             ? ""
+                             : " (no rumble baseline: no escalation)"));
+                }
+                if (revive_fired_at) {
+                    Uint64 rx_now =
+                        input_rx_last_.load(std::memory_order_relaxed);
+                    if (rx_now > revive_fired_at) {
+                        log("input revive: server input traffic is back");
+                        revive_fired_at = 0;
+                    } else if (now - revive_fired_at > 8000) {
+                        if (revive_had_baseline) {
+                            log("input revive did not bring the server's "
+                                "input side back: reconnecting");
+                            set_status("Reconnecting...");
+                            reconnect_requested_ = true;
+                            return false;
+                        }
+                        revive_fired_at = 0;  // nothing to judge silence by
+                    }
                 }
             }
         }
