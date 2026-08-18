@@ -2310,6 +2310,102 @@ Input poll_input(SDL_Joystick*& joystick) {
         joystick = nullptr;
     }
     if (!joystick && SDL_NumJoysticks() > 0) joystick = SDL_JoystickOpen(0);
+#ifdef __SWITCH__
+    // Zombie-joystick recovery (ported from the Bergamo build, #67): a
+    // disconnect/reconnect can leave SDL holding a handle it still reports
+    // as attached but that never updates again -- the heal above cannot see
+    // it. libnx's own pad state is an independent hardware reference: if the
+    // console sees real button/stick activity while SDL's entire view of the
+    // joystick stays bit-identical for 250 ms, the handle is dead. Reopen
+    // just the SDL handle; the stream/session is untouched.
+    static PadState s_native_pad;
+    static bool s_native_ready = false;
+    static bool s_have_sdl_signature = false;
+    static u64 s_prev_native_buttons = 0;
+    static HidAnalogStickState s_prev_native_left = {};
+    static HidAnalogStickState s_prev_native_right = {};
+    static Uint64 s_last_sdl_signature = 0;
+    static Uint64 s_zombie_since = 0;
+    static Uint64 s_zombie_signature = 0;
+
+    if (!s_native_ready) {
+        padInitializeDefault(&s_native_pad);
+        padUpdate(&s_native_pad);
+        s_prev_native_buttons = padGetButtons(&s_native_pad);
+        s_prev_native_left = padGetStickPos(&s_native_pad, 0);
+        s_prev_native_right = padGetStickPos(&s_native_pad, 1);
+        s_native_ready = true;
+    }
+
+    padUpdate(&s_native_pad);
+
+    if (joystick && padIsConnected(&s_native_pad)) {
+        SDL_JoystickUpdate();
+
+        // FNV-1a over every SDL button and axis: any change in what SDL
+        // sees for this joystick changes the signature.
+        Uint64 sdl_signature = 1469598103934665603ULL;
+        auto mix_sdl = [&](Uint64 value) {
+            sdl_signature ^= value;
+            sdl_signature *= 1099511628211ULL;
+        };
+        int button_count = SDL_JoystickNumButtons(joystick);
+        for (int i = 0; i < button_count; ++i)
+            mix_sdl(static_cast<Uint64>(SDL_JoystickGetButton(joystick, i)));
+        int axis_count = SDL_JoystickNumAxes(joystick);
+        for (int i = 0; i < axis_count; ++i)
+            mix_sdl(static_cast<Uint16>(SDL_JoystickGetAxis(joystick, i)));
+
+        u64 native_buttons = padGetButtons(&s_native_pad);
+        HidAnalogStickState native_left = padGetStickPos(&s_native_pad, 0);
+        HidAnalogStickState native_right = padGetStickPos(&s_native_pad, 1);
+        auto stick_delta = [](s32 a, s32 b) {
+            s32 d = a - b;
+            return d < 0 ? -d : d;
+        };
+        bool native_button_change = native_buttons != s_prev_native_buttons;
+        bool native_stick_change =
+            stick_delta(native_left.x, s_prev_native_left.x) > 6000 ||
+            stick_delta(native_left.y, s_prev_native_left.y) > 6000 ||
+            stick_delta(native_right.x, s_prev_native_right.x) > 6000 ||
+            stick_delta(native_right.y, s_prev_native_right.y) > 6000;
+
+        Uint64 now = SDL_GetTicks64();
+        if (s_have_sdl_signature &&
+            (native_button_change || native_stick_change)) {
+            if (sdl_signature == s_last_sdl_signature) {
+                if (!s_zombie_since) {
+                    s_zombie_since = now;
+                    s_zombie_signature = sdl_signature;
+                }
+            } else {
+                s_zombie_since = 0;
+            }
+        }
+        // SDL eventually moved, so this was ordinary scheduling latency.
+        if (s_zombie_since && sdl_signature != s_zombie_signature)
+            s_zombie_since = 0;
+
+        // libnx saw real input but SDL stayed frozen for 250 ms.
+        if (s_zombie_since && now - s_zombie_since >= 250) {
+            std::printf("[input] SDL joystick stale -- reopening handle\n");
+            std::fflush(stdout);
+            SDL_JoystickClose(joystick);
+            joystick = nullptr;
+            SDL_JoystickUpdate();
+            if (SDL_NumJoysticks() > 0) joystick = SDL_JoystickOpen(0);
+            s_zombie_since = 0;
+            s_have_sdl_signature = false;
+        } else {
+            s_last_sdl_signature = sdl_signature;
+            s_have_sdl_signature = true;
+        }
+
+        s_prev_native_buttons = native_buttons;
+        s_prev_native_left = native_left;
+        s_prev_native_right = native_right;
+    }
+#endif
     // Left analog stick also drives menu navigation: emit one directional
     // step each time the stick crosses into a deflected zone (matches the
     // one-per-press behaviour of the d-pad).
