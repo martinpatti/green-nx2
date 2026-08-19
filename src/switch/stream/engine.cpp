@@ -1850,7 +1850,7 @@ void Engine::send_gamepad(const xcloud::GamepadFrame& frame) {
             std::lock_guard<std::mutex> input_lock(input_mutex_);
             input_.rollback_sequence();
         }
-        std::vector<uint8_t> packet;
+       std::vector<uint8_t> packet;
         {
             std::lock_guard<std::mutex> input_lock(input_mutex_);
             packet = input_.gamepad_packet(frame, static_cast<double>(SDL_GetTicks64() - stream_epoch_));
@@ -1876,28 +1876,6 @@ void Engine::request_keyframe_locked() {
     if (!handshake_done_ || !peer_) return;
 
     auto now = SDL_GetTicks64();
-    if (now - last_keyframe_req_.load() < 1000) return;
-    last_keyframe_req_ = now;
-    pli_sent_++;
-    peer_connection_request_keyframe(peer_);  // RTCP PLI (the one xCloud honors)
-    send_on_channel_locked("control", xcloud::video_keyframe_requested());
-}
-
-}  // namespace gnx::stream
-    // Called off the worker (decode thread / render thread). Opportunistic:
-    // it self-throttles to 1/s and the worker sends PLIs on its own, so
-    // skipping when the lock is busy loses nothing -- and never blocks a
-    // latency-critical thread on the network lock.
-    std::unique_lock<std::timed_mutex> lock(peer_mutex_, std::try_to_lock);
-    if (!lock.owns_lock()) return;
-    request_keyframe_locked();
-}
-
-// Caller must hold peer_mutex_ (used from on_video, which runs under it).
-void Engine::request_keyframe_locked() {
-    if (!handshake_done_ || !peer_) return;
-    // Throttle: at most one request per second.
-    Uint64 now = SDL_GetTicks64();
     if (now - last_keyframe_req_.load() < 1000) return;
     last_keyframe_req_ = now;
     pli_sent_++;
