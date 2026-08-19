@@ -1511,10 +1511,16 @@ bool Engine::run_peer(GssvSession& session) {
                                         "input", input_.client_metadata()))
                                     input_.rollback_sequence();
                             }
-                            send_on_channel_locked(
-                                "control", xcloud::gamepad_changed(0, false));
-                            send_on_channel_locked(
-                                "control", xcloud::gamepad_changed(0, true));
+                           send_on_channel_locked(
+    "control", xcloud::gamepad_changed(0, false));
+send_on_channel_locked(
+    "control", xcloud::gamepad_changed(0, true));
+
+//  el anuncio del Jugador 2 (índice 1)
+send_on_channel_locked(
+    "control", xcloud::gamepad_changed(1, false));
+send_on_channel_locked(
+    "control", xcloud::gamepad_changed(1, true));
                         }
                     }
                     revive_fired_at = now;
@@ -1831,14 +1837,19 @@ void Engine::send_gamepad(const xcloud::GamepadFrame& frame) {
     // time). Building before the lock burned hundreds of numbers during a
     // lag spike while the worker sat in a blocking send; the input channel
     // then stayed dead for the rest of the session (#45).
-    std::vector<uint8_t> packet;
-    {
-        std::lock_guard<std::mutex> input_lock(input_mutex_);
-        packet = input_.gamepad_packet(
-            frame, static_cast<double>(SDL_GetTicks64() - stream_epoch_));
-    }
-    if (send_binary_on_channel_locked("input", packet)) {
-        input_sent_++;
+  std::vector<uint8_t> packet_p1;
+        std::vector<uint8_t> packet_p2;
+        {
+            std::lock_guard<std::mutex> input_lock(input_mutex_);
+            packet_p1 = input_.gamepad_packet(frame, static_cast<double>(SDL_GetTicks64() - stream_epoch_), 0);
+            packet_p2 = input_.gamepad_packet(frame, static_cast<double>(SDL_GetTicks64() - stream_epoch_), 1);
+        }
+        if (send_binary_on_channel_locked("input", packet_p1)) {
+            input_sent_++;
+        }
+        if (send_binary_on_channel_locked("input", packet_p2)) {
+            input_sent_++;
+        }
     } else {
         input_send_fail_++;
         // Give the unused number back so the next frame stays contiguous.
