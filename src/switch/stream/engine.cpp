@@ -1837,20 +1837,7 @@ void Engine::send_gamepad(const xcloud::GamepadFrame& frame) {
     // time). Building before the lock burned hundreds of numbers during a
     // lag spike while the worker sat in a blocking send; the input channel
     // then stayed dead for the rest of the session (#45).
- std::vector<uint8_t> packet;
-        {
-            std::lock_guard<std::mutex> input_lock(input_mutex_);
-            packet = input_.gamepad_packet(frame, static_cast<double>(SDL_GetTicks64() - stream_epoch_));
-        }
-        if (send_binary_on_channel_locked("input", packet)) {
-            input_sent_++;
-        } else {
-            input_send_fail_++;
-            // Give the unused number back so the next frame stays contiguous.
-            std::lock_guard<std::mutex> input_lock(input_mutex_);
-            input_.rollback_sequence();
-        }
-       std::vector<uint8_t> packet;
+std::vector<uint8_t> packet;
         {
             std::lock_guard<std::mutex> input_lock(input_mutex_);
             packet = input_.gamepad_packet(frame, static_cast<double>(SDL_GetTicks64() - stream_epoch_));
