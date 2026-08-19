@@ -1845,7 +1845,7 @@ std::vector<uint8_t> packet;
         if (send_binary_on_channel_locked("input", packet)) {
             input_sent_++;
         } else {
-           input_send_fail_++;
+            input_send_fail_++;
             // Give the unused number back so the next frame stays contiguous.
             std::lock_guard<std::mutex> input_lock(input_mutex_);
             input_.rollback_sequence();
@@ -1871,4 +1871,3 @@ void Engine::request_keyframe_locked() {
 }
 
 }  // namespace gnx::stream
-}
