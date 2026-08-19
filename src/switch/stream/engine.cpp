@@ -1866,7 +1866,7 @@ void Engine::request_keyframe_locked() {
     if (now - last_keyframe_req_.load() < 1000) return;
     last_keyframe_req_ = now;
     pli_sent_++;
-    peer_connection_request_keyframe(peer_);  // RTCP PLI (the one xCloud honors)
+    peer_connection_request_keyframe(peer_);  // RTCP PLI (the one xcloud honors)
     send_on_channel_locked("control", xcloud::video_keyframe_requested());
 }
 
