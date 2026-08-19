@@ -1870,3 +1870,4 @@ void Engine::request_keyframe_locked() {
 }
 
 }  // namespace gnx::stream
+}
