@@ -1849,7 +1849,7 @@ std::vector<uint8_t> packet;
             // Give the unused number back so the next frame stays contiguous.
             std::lock_guard<std::mutex> input_lock(input_mutex_);
             input_.rollback_sequence();
-    
+  }
     }
 
 void Engine::request_keyframe() {
